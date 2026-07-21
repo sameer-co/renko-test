@@ -35,7 +35,7 @@ TP_SL_MULT      = 3.0          # take-profit distance = 3 × SL distance
 LOOKBACK_DAYS   = 365          # how many days of history to test
 SEED_CANDLES    = 400          # warm-up bars (excluded from trading)
 
-CANDLE_INTERVAL  = "30m"            # Binance interval string
+CANDLE_INTERVAL  = "1h"            # Binance interval string
 BARS_PER_DAY     = 480             # 1440 min/day ÷ 3 min = 480 bars/day
 
 BINANCE_REST_URL = "https://api.binance.com"
