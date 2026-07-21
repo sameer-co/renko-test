@@ -1,521 +1,411 @@
 """
-SOL/USDT Renko Back-Testing Script
-====================================
-Exchange   : Binance public REST API (no API key needed)
-Data       : 3-minute candles, last 365 days (~175,200 bars)
-Box Size   : ATR-14 (adaptive — recalculated every closed candle, same as live bot)
-Buy Signal : First GREEN brick after a trend reversal (red → green)
-Stop-Loss  : 1.5 × ATR below entry
-Take-Profit: 3 × SL distance above entry  (i.e. 4.5 × ATR)
+╔══════════════════════════════════════════════════════════════╗
+║   SOL/USDT  |  9 EMA × 9 SMA(EMA)  |  BACKTEST             ║
+║   EXACT same logic as the live tracker — replayed on history ║
+╚══════════════════════════════════════════════════════════════╝
 
-Output     : Console summary + backtest_results.csv + equity_curve.png
+SETUP:
+  pip install requests pandas
+
+EDIT THE CONFIG BLOCK BELOW, THEN RUN:
+  python sol_backtest.py
+
+OUTPUT:
+  - Printed summary in terminal
+  - trades_backtest.csv  (every closed trade)
+  - equity_curve.csv     (capital after every closed trade)
 """
 
-import asyncio
-import csv
-import logging
-import math
+# ─────────────────────── CONFIG ───────────────────────────── #
+
+SYMBOL         = "SOLUSDT"          # Binance pair
+INTERVAL       = "1m"               # Candle interval
+
+# ── Date range ───────────────────────────────────────────── #
+# Format: "YYYY-MM-DD"  (UTC midnight used automatically)
+START_DATE     = "2024-01-01"
+END_DATE       = "2024-03-31"
+
+EMA_PERIOD     = 9                  # Base EMA period
+SMA_PERIOD     = 9                  # SMA applied ON TOP of the EMA
+
+SL_BUFFER_PCT  = 0.20               # Buffer % added to raw SL distance
+RISK_REWARD    = 2.0                # TP = entry + SL_dist × RISK_REWARD
+
+# ── Position Sizing ──────────────────────────────────────── #
+RISK_MODE      = "fixed"            # "fixed" → flat USD | "percent" → % of capital
+RISK_FIXED_USD = 100                # USD risked per trade (if RISK_MODE = "fixed")
+RISK_PCT       = 1.0                # % of capital risked  (if RISK_MODE = "percent")
+CAPITAL        = 10_000             # Starting capital
+
+# ── Output ───────────────────────────────────────────────── #
+SAVE_TRADES_CSV = True              # Save every closed trade
+SAVE_EQUITY_CSV = True              # Save equity curve
+TRADES_CSV_PATH = "trades_backtest.csv"
+EQUITY_CSV_PATH = "equity_curve.csv"
+
+# ──────────────────────────────────────────────────────────── #
+
+import requests
 import time
-from dataclasses import dataclass, field
+import csv
+import os
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 from typing import Optional
 
-import aiohttp
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG  (keep in sync with live bot)
-# ─────────────────────────────────────────────────────────────────────────────
-SYMBOL          = "SOLUSDT"
-ATR_PERIOD      = 14
-ATR_MULTIPLIER  = 1.0          # box_size = ATR × multiplier
-SL_ATR_MULT     = 1.5          # stop-loss  = entry − 1.5 × ATR
-TP_SL_MULT      = 3.0          # take-profit distance = 3 × SL distance
-
-# Backtest window
-LOOKBACK_DAYS   = 730          # how many days of history to test
-SEED_CANDLES    = 400          # warm-up bars (excluded from trading)
-
-CANDLE_INTERVAL  = "1h"            # Binance interval string
-BARS_PER_DAY     = 480             # 1440 min/day ÷ 3 min = 480 bars/day
-
-BINANCE_REST_URL = "https://api.binance.com"
-MAX_CANDLES_PER_REQUEST = 1000  # Binance hard limit per call
-
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("renko_backtest_3m")
+import pandas as pd
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ATR CALCULATOR  (identical to live bot — Wilder / RMA smoothing)
-# ══════════════════════════════════════════════════════════════════════════════
-class ATR:
-    def __init__(self, period: int = 14):
-        self.period       = period
-        self._prev_close: Optional[float] = None
-        self._rma:        Optional[float] = None
-        self._count       = 0
-        self._warm        = False
-        self._sum_tr      = 0.0
+# ═══════════════════════ DATA FETCH ════════════════════════════
 
-    @property
-    def value(self) -> Optional[float]:
-        return self._rma if self._warm else None
+BINANCE_BASE = "https://api.binance.com"
 
-    def update(self, high: float, low: float, close: float) -> Optional[float]:
-        if self._prev_close is None:
-            tr = high - low
-        else:
-            tr = max(high - low,
-                     abs(high - self._prev_close),
-                     abs(low  - self._prev_close))
+def date_to_ms(date_str: str) -> int:
+    """Convert 'YYYY-MM-DD' string to millisecond timestamp (UTC midnight)."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
-        self._prev_close = close
-        self._count += 1
-
-        if not self._warm:
-            self._sum_tr += tr
-            if self._count >= self.period:
-                self._rma  = self._sum_tr / self.period
-                self._warm = True
-        else:
-            alpha     = 1.0 / self.period
-            self._rma = self._rma * (1 - alpha) + tr * alpha
-
-        return self._rma if self._warm else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RENKO ENGINE  (identical to live bot)
-# ══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class RenkoBrick:
-    direction:   int
-    open_price:  float
-    close_price: float
-    formed_at:   datetime
-
-
-@dataclass
-class RenkoState:
-    bricks:       list  = field(default_factory=list)
-    last_close:   Optional[float] = None
-    current_dir:  Optional[int]   = None
-    box_size:     Optional[float] = None
-    pending_open: Optional[float] = None
-
-    def set_box(self, box: float) -> None:
-        self.box_size = round(box, 4)
-
-    def _snap(self, price: float, box: float) -> float:
-        return math.floor(price / box) * box
-
-    def seed_price(self, price: float) -> None:
-        if self.last_close is None and self.box_size:
-            self.last_close   = self._snap(price, self.box_size)
-            self.pending_open = self.last_close
-
-    def feed(self, price: float, ts: datetime) -> list:
-        if self.box_size is None or self.last_close is None:
-            return []
-
-        box    = self.box_size
-        new_bx = []
-
-        while True:
-            up_target   = self.last_close + box
-            down_target = self.last_close - box
-
-            if price >= up_target:
-                open_p = self.last_close
-                brick  = RenkoBrick(+1, open_p, open_p + box, ts)
-                new_bx.append(brick)
-                self.bricks.append(brick)
-                self.last_close  = open_p + box
-                self.current_dir = +1
-
-            elif price <= down_target:
-                open_p = self.last_close
-                brick  = RenkoBrick(-1, open_p, open_p - box, ts)
-                new_bx.append(brick)
-                self.bricks.append(brick)
-                self.last_close  = open_p - box
-                self.current_dir = -1
-            else:
-                break
-
-        return new_bx
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TRADE  (mirrors live bot)
-# ══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class Trade:
-    entry_price:   float
-    sl:            float
-    tp:            float
-    atr_at_entry:  float
-    box_at_entry:  float
-    entered_at:    datetime
-    status:        str             = "OPEN"
-    exit_price:    Optional[float] = None
-    exited_at:     Optional[datetime] = None
-
-    @property
-    def pnl_pct(self) -> Optional[float]:
-        if self.exit_price is None:
-            return None
-        return (self.exit_price - self.entry_price) / self.entry_price * 100
-
-    @property
-    def duration_minutes(self) -> Optional[float]:
-        if self.exited_at is None:
-            return None
-        return (self.exited_at - self.entered_at).total_seconds() / 60
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHER  (paginated — handles 365 days of 3-min bars)
-# ══════════════════════════════════════════════════════════════════════════════
-async def fetch_all_klines(session: aiohttp.ClientSession,
-                           days: int = LOOKBACK_DAYS) -> list[dict]:
+def fetch_candles_range(symbol: str, interval: str,
+                        start_ms: int, end_ms: int) -> pd.DataFrame:
     """
-    Fetch 3-min candles for the past `days` days from Binance.
-    Binance caps at 1 000 candles per request, so we paginate.
-    Total bars ≈ days × 480.
+    Fetch ALL 1m candles between start_ms and end_ms.
+    Binance returns max 1000 candles per call — we paginate automatically.
     """
-    end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - days * 24 * 3600 * 1000
+    all_rows = []
+    current_start = start_ms
 
-    url      = f"{BINANCE_REST_URL}/api/v3/klines"
-    candles  = []
-    cursor   = start_ms
-    total_expected = days * BARS_PER_DAY
+    print(f"  Fetching candles from Binance (this may take a while for long ranges)...")
+    batch = 0
 
-    log.info("Downloading %d days of 3-min data (~%d bars) …", days, total_expected)
-
-    while cursor < end_ms:
-        params = {
-            "symbol":    SYMBOL,
-            "interval":  CANDLE_INTERVAL,
-            "startTime": cursor,
-            "endTime":   end_ms,
-            "limit":     MAX_CANDLES_PER_REQUEST,
-        }
-        async with session.get(url, params=params,
-                               timeout=aiohttp.ClientTimeout(total=30)) as r:
-            r.raise_for_status()
-            raw = await r.json()
+    while current_start < end_ms:
+        batch += 1
+        resp = requests.get(
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={
+                "symbol"    : symbol,
+                "interval"  : interval,
+                "startTime" : current_start,
+                "endTime"   : end_ms,
+                "limit"     : 1000,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
 
         if not raw:
             break
 
-        for k in raw:
-            candles.append({
-                "open":  float(k[1]),
-                "high":  float(k[2]),
-                "low":   float(k[3]),
-                "close": float(k[4]),
-                "ts":    datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
-            })
+        all_rows.extend(raw)
+        last_open_time = raw[-1][0]
 
-        # Next page starts 1 ms after last candle open time
-        cursor = int(raw[-1][0]) + 1
+        # Advance past the last candle fetched
+        # Each 1m candle is 60 000 ms
+        current_start = last_open_time + 60_000
 
-        log.info("  Downloaded %d / ~%d candles (3m) …", len(candles), total_expected)
+        if batch % 10 == 0:
+            pct = (current_start - start_ms) / (end_ms - start_ms) * 100
+            print(f"    ...{pct:.0f}% downloaded ({len(all_rows):,} candles so far)")
 
-        # Polite rate-limit pause (Binance allows 1200 weight/min; each kline = 1)
-        await asyncio.sleep(0.25)
+        # Respect Binance rate-limit (1200 weight/min; klines = 1 weight)
+        time.sleep(0.15)
 
-    # Drop the last (potentially unclosed) candle
-    if candles:
-        candles = candles[:-1]
+    cols = ["open_time","open","high","low","close","volume",
+            "close_time","qav","num_trades","tbbav","tbqav","ignore"]
+    df = pd.DataFrame(all_rows, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for c in ["open","high","low","close"]:
+        df[c] = df[c].astype(float)
 
-    log.info("Total candles fetched (excl. last open): %d", len(candles))
-    return candles
+    # Drop the last (possibly still-forming) candle — same as live script
+    df = df.iloc[:-1].reset_index(drop=True)
+
+    print(f"  ✓ Total candles loaded: {len(df):,}\n")
+    return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BACK-TEST ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-def run_backtest(candles: list[dict]) -> list[Trade]:
-    """
-    Replay candles with the same ATR / Renko / trade logic as the live bot.
-    Returns list of completed trades.
-    """
-    atr      = ATR(ATR_PERIOD)
-    renko    = RenkoState()
-    trades:  list[Trade] = []
-    open_trade: Optional[Trade] = None
+# ═══════════════════════ INDICATORS ════════════════════════════
+# ── IDENTICAL to live script ────────────────────────────────── #
 
-    dir_before: Optional[int] = None
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ema"]            = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["sma_ema"]        = df["ema"].rolling(SMA_PERIOD).mean()
+    df["ema_above"]      = df["ema"] > df["sma_ema"]
+    df["ema_above_prev"] = df["ema_above"].shift(1).fillna(False).astype(bool)
+    df["signal_buy"]     = (~df["ema_above_prev"]) & df["ema_above"]
+    return df
 
-    log.info("Running backtest on %d candles …", len(candles))
 
-    for i, c in enumerate(candles):
-        price = c["close"]
-        high  = c["high"]
-        low   = c["low"]
-        ts    = c["ts"]
+# ═══════════════════════ POSITION SIZING ═══════════════════════
+# ── IDENTICAL to live script ────────────────────────────────── #
 
-        # ── Check open trade against this candle's High/Low ───────────────
-        # Use candle body to simulate intra-candle SL/TP touches.
-        # Convention: check SL first (conservative / realistic).
+def compute_risk(capital: float) -> float:
+    if RISK_MODE == "fixed":
+        return RISK_FIXED_USD
+    return capital * (RISK_PCT / 100)
+
+
+# ═══════════════════════ TRADE DATACLASS ═══════════════════════
+
+@dataclass
+class Trade:
+    entry_time  : str
+    entry       : float
+    sl          : float
+    tp          : float
+    sl_dist     : float
+    risk_usd    : float
+    qty         : float
+    trigger_low : float
+
+
+# ═══════════════════════ CSV OUTPUT ════════════════════════════
+
+TRADE_HEADERS = [
+    "trade_num","entry_time","exit_time","entry","sl","tp","exit_price",
+    "sl_dist","qty","risk_usd","pnl_usd","pnl_r","result","capital"
+]
+
+EQUITY_HEADERS = ["trade_num","exit_time","capital","net_pnl","net_r"]
+
+
+def save_trades(records: list):
+    if not SAVE_TRADES_CSV:
+        return
+    with open(TRADES_CSV_PATH, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TRADE_HEADERS)
+        w.writeheader()
+        w.writerows(records)
+    print(f"  Trades saved → {TRADES_CSV_PATH}")
+
+
+def save_equity(equity: list):
+    if not SAVE_EQUITY_CSV:
+        return
+    with open(EQUITY_CSV_PATH, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=EQUITY_HEADERS)
+        w.writeheader()
+        w.writerows(equity)
+    print(f"  Equity curve saved → {EQUITY_CSV_PATH}")
+
+
+# ═══════════════════════ BACKTEST ENGINE ═══════════════════════
+# ── Logic mirrors the live main() loop exactly ──────────────── #
+
+def run_backtest(df: pd.DataFrame):
+    capital   = float(CAPITAL)
+    net_pnl   = 0.0
+    total = wins = losses = 0
+
+    open_trade : Optional[Trade] = None
+    trade_records = []
+    equity_curve  = []
+
+    warmup = EMA_PERIOD + SMA_PERIOD  # skip rows before indicators are valid
+
+    print("  Running backtest...\n")
+
+    for i in range(warmup, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i - 1]      # already processed in prior iteration
+
+        # ── Step 1: Check open trade for SL / TP ────────────
+        # (Live script checks this BEFORE looking for new signals)
         if open_trade is not None:
-            # Did price touch SL?
+            low  = row["low"]
+            high = row["high"]
+
+            exit_price = exit_reason = None
+
+            # SL checked first — same priority as live script
             if low <= open_trade.sl:
-                open_trade.status     = "HIT_SL"
-                open_trade.exit_price = open_trade.sl
-                open_trade.exited_at  = ts
-                trades.append(open_trade)
-                open_trade = None
-            # Did price touch TP? (only if SL not already hit)
+                exit_price  = open_trade.sl
+                exit_reason = "SL"
             elif high >= open_trade.tp:
-                open_trade.status     = "HIT_TP"
-                open_trade.exit_price = open_trade.tp
-                open_trade.exited_at  = ts
-                trades.append(open_trade)
+                exit_price  = open_trade.tp
+                exit_reason = "TP"
+
+            if exit_reason:
+                pnl_usd  = (exit_price - open_trade.entry) * open_trade.qty
+                pnl_r    = pnl_usd / open_trade.risk_usd
+                net_pnl  += pnl_usd
+                capital  += pnl_usd
+                total    += 1
+                if exit_reason == "TP":
+                    wins += 1
+                else:
+                    losses += 1
+
+                trade_records.append({
+                    "trade_num" : total,
+                    "entry_time": open_trade.entry_time,
+                    "exit_time" : row["open_time"].strftime("%Y-%m-%d %H:%M UTC"),
+                    "entry"     : round(open_trade.entry, 4),
+                    "sl"        : round(open_trade.sl, 4),
+                    "tp"        : round(open_trade.tp, 4),
+                    "exit_price": round(exit_price, 4),
+                    "sl_dist"   : round(open_trade.sl_dist, 4),
+                    "qty"       : round(open_trade.qty, 4),
+                    "risk_usd"  : round(open_trade.risk_usd, 2),
+                    "pnl_usd"   : round(pnl_usd, 2),
+                    "pnl_r"     : round(pnl_r, 3),
+                    "result"    : exit_reason,
+                    "capital"   : round(capital, 2),
+                })
+                equity_curve.append({
+                    "trade_num" : total,
+                    "exit_time" : row["open_time"].strftime("%Y-%m-%d %H:%M UTC"),
+                    "capital"   : round(capital, 2),
+                    "net_pnl"   : round(net_pnl, 2),
+                    "net_r"     : round(wins * RISK_REWARD - losses * 1.0, 2),
+                })
+
                 open_trade = None
 
-        # ── Update ATR with closed candle ──────────────────────────────────
-        atr_val = atr.update(high, low, price)
-        if atr_val is None:
-            continue   # still warming up
+        # ── Step 2: Check for new BUY signal on the PREVIOUS candle ──
+        # In live script: signal is on 'latest' (last closed candle),
+        # entry is on df.iloc[-1]["open"] (next/current forming candle open).
+        # In backtest: signal candle = row i-1, entry candle = row i.
+        # We use prev for signal detection and row["open"] for entry.
 
-        # ── Adaptive box size (same 5% change threshold as live bot) ──────
-        new_box = round(atr_val * ATR_MULTIPLIER, 4)
-        if renko.box_size is None:
-            renko.set_box(new_box)
-            renko.seed_price(price)
-        else:
-            if abs(new_box - renko.box_size) / renko.box_size > 0.05:
-                renko.set_box(new_box)
+        if open_trade is None and prev["signal_buy"]:
+            next_open = row["open"]        # entry price = current candle open
+            trig_low  = prev["low"]        # SL anchor = signal candle low
 
-        # ── Feed close to Renko ────────────────────────────────────────────
-        dir_before_tick = renko.current_dir
-        new_bricks = renko.feed(price, ts)
+            raw_sl_dist = next_open - trig_low
+            if raw_sl_dist > 0:
+                sl_dist  = raw_sl_dist * (1 + SL_BUFFER_PCT / 100)
+                sl       = next_open - sl_dist
+                tp       = next_open + sl_dist * RISK_REWARD
+                risk_usd = compute_risk(capital)
+                qty      = risk_usd / sl_dist
 
-        for brick in new_bricks:
-            # Signal: first green brick after red→green reversal
-            if (
-                brick.direction == +1
-                and dir_before_tick == -1
-                and open_trade is None        # no concurrent trade
-                and i >= SEED_CANDLES         # past warm-up period
-            ):
-                entry   = brick.close_price
-                sl      = round(entry - SL_ATR_MULT * atr_val, 4)
-                sl_dist = entry - sl
-                tp      = round(entry + TP_SL_MULT * sl_dist, 4)
                 open_trade = Trade(
-                    entry_price  = entry,
-                    sl           = sl,
-                    tp           = tp,
-                    atr_at_entry = atr_val,
-                    box_at_entry = renko.box_size,
-                    entered_at   = ts,
+                    entry_time  = row["open_time"].strftime("%Y-%m-%d %H:%M UTC"),
+                    entry       = next_open,
+                    sl          = sl,
+                    tp          = tp,
+                    sl_dist     = sl_dist,
+                    risk_usd    = risk_usd,
+                    qty         = qty,
+                    trigger_low = trig_low,
                 )
 
-            # Keep dir_before updated within same batch of bricks
-            dir_before_tick = brick.direction
-
-    # Mark any still-open trade as cancelled at last candle close
+    # ── Handle trade still open at end of data ───────────────
     if open_trade is not None:
-        last_price = candles[-1]["close"]
-        open_trade.status     = "CANCELLED"
-        open_trade.exit_price = last_price
-        open_trade.exited_at  = candles[-1]["ts"]
-        trades.append(open_trade)
+        last_close = df.iloc[-1]["close"]
+        pnl_usd   = (last_close - open_trade.entry) * open_trade.qty
+        pnl_r     = pnl_usd / open_trade.risk_usd
+        net_pnl  += pnl_usd
+        capital  += pnl_usd
+        total    += 1
+        print(f"  ⚠  Trade still open at end of data — closed at last price ${last_close:.4f}")
+        trade_records.append({
+            "trade_num" : total,
+            "entry_time": open_trade.entry_time,
+            "exit_time" : df.iloc[-1]["open_time"].strftime("%Y-%m-%d %H:%M UTC"),
+            "entry"     : round(open_trade.entry, 4),
+            "sl"        : round(open_trade.sl, 4),
+            "tp"        : round(open_trade.tp, 4),
+            "exit_price": round(last_close, 4),
+            "sl_dist"   : round(open_trade.sl_dist, 4),
+            "qty"       : round(open_trade.qty, 4),
+            "risk_usd"  : round(open_trade.risk_usd, 2),
+            "pnl_usd"   : round(pnl_usd, 2),
+            "pnl_r"     : round(pnl_r, 3),
+            "result"    : "OPEN_AT_END",
+            "capital"   : round(capital, 2),
+        })
 
-    return trades
+    return total, wins, losses, net_pnl, capital, trade_records, equity_curve
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RESULTS & REPORTING
-# ══════════════════════════════════════════════════════════════════════════════
-def print_summary(trades: list[Trade]) -> None:
-    closed = [t for t in trades if t.status != "CANCELLED"]
-    wins   = [t for t in closed if t.status == "HIT_TP"]
-    losses = [t for t in closed if t.status == "HIT_SL"]
-    cancelled = [t for t in trades if t.status == "CANCELLED"]
+# ═══════════════════════ SUMMARY PRINT ═════════════════════════
 
-    total  = len(closed)
-    if total == 0:
-        log.warning("No completed trades found.")
-        return
+def print_summary(total, wins, losses, net_pnl, start_cap, end_cap,
+                  trade_records):
+    win_rate   = wins / total * 100 if total else 0
+    net_r      = wins * RISK_REWARD - losses * 1.0
+    return_pct = (end_cap - start_cap) / start_cap * 100
 
-    pnls      = [t.pnl_pct for t in closed]
-    cum_pnl   = sum(pnls)
-    avg_pnl   = cum_pnl / total
-    win_rate  = len(wins) / total * 100
-
-    avg_win   = sum(t.pnl_pct for t in wins)   / len(wins)   if wins   else 0.0
-    avg_loss  = sum(t.pnl_pct for t in losses) / len(losses) if losses else 0.0
-
-    # Max drawdown on cumulative PnL curve
-    equity    = []
-    running   = 0.0
-    peak      = 0.0
-    max_dd    = 0.0
-    for p in pnls:
-        running += p
-        equity.append(running)
-        if running > peak:
-            peak = running
-        dd = peak - running
+    # Max drawdown from equity curve
+    capitals = [start_cap] + [r["capital"] for r in trade_records]
+    peak = capitals[0]
+    max_dd = 0.0
+    for c in capitals:
+        if c > peak:
+            peak = c
+        dd = (peak - c) / peak * 100
         if dd > max_dd:
             max_dd = dd
 
-    avg_dur = sum(t.duration_minutes for t in closed if t.duration_minutes) / total
+    # Avg win / avg loss
+    pnls = [r["pnl_usd"] for r in trade_records if r["result"] != "OPEN_AT_END"]
+    win_pnls  = [p for p in pnls if p > 0]
+    loss_pnls = [p for p in pnls if p <= 0]
+    avg_win   = sum(win_pnls)  / len(win_pnls)  if win_pnls  else 0
+    avg_loss  = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
 
-    # Profit factor
-    gross_win  = sum(t.pnl_pct for t in wins)
-    gross_loss = abs(sum(t.pnl_pct for t in losses)) or 1e-9
-    pf = gross_win / gross_loss
-
-    bar = "═" * 50
-    print(f"\n{bar}")
-    print(f"  RENKO BACKTEST RESULTS — {SYMBOL}  ({LOOKBACK_DAYS}d of 3-min data)")
-    print(bar)
-    print(f"  Total trades      : {total}  (+{len(cancelled)} cancelled/open)")
-    print(f"  Wins (TP hit)     : {len(wins)}")
-    print(f"  Losses (SL hit)   : {len(losses)}")
-    print(f"  Win Rate          : {win_rate:.1f}%")
-    print(f"  ─────────────────────────────────────────────")
-    print(f"  Avg PnL / trade   : {avg_pnl:+.2f}%")
-    print(f"  Avg Win           : {avg_win:+.2f}%")
-    print(f"  Avg Loss          : {avg_loss:+.2f}%")
-    print(f"  Profit Factor     : {pf:.2f}")
-    print(f"  ─────────────────────────────────────────────")
-    print(f"  Cumulative PnL    : {cum_pnl:+.2f}%  (equal-weight, no compounding)")
-    print(f"  Max Drawdown      : -{max_dd:.2f}%")
-    print(f"  Avg Trade Duration: {avg_dur:.0f} min")
-    print(bar)
-
-    if trades:
-        first = trades[0].entered_at.strftime("%Y-%m-%d")
-        last  = trades[-1].entered_at.strftime("%Y-%m-%d")
-        print(f"  Period            : {first} → {last}")
-        print(bar)
-
-
-def save_csv(trades: list[Trade], path: str = "backtest_results.csv") -> None:
-    if not trades:
-        return
-    fields = [
-        "trade_no", "status", "entry_price", "sl", "tp",
-        "exit_price", "pnl_pct", "atr_at_entry", "box_at_entry",
-        "entered_at", "exited_at", "duration_min",
-    ]
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for i, t in enumerate(trades, 1):
-            w.writerow({
-                "trade_no":      i,
-                "status":        t.status,
-                "entry_price":   t.entry_price,
-                "sl":            t.sl,
-                "tp":            t.tp,
-                "exit_price":    t.exit_price,
-                "pnl_pct":       f"{t.pnl_pct:+.4f}" if t.pnl_pct else "",
-                "atr_at_entry":  f"{t.atr_at_entry:.4f}",
-                "box_at_entry":  f"{t.box_at_entry:.4f}",
-                "entered_at":    t.entered_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "exited_at":     t.exited_at.strftime("%Y-%m-%d %H:%M:%S UTC") if t.exited_at else "",
-                "duration_min":  f"{t.duration_minutes:.0f}" if t.duration_minutes else "",
-            })
-    log.info("Trade log saved → %s", path)
+    print()
+    print("╔══════════════════════════════════════════════╗")
+    print("║           BACKTEST RESULTS SUMMARY           ║")
+    print("╚══════════════════════════════════════════════╝")
+    print(f"  Symbol      : {SYMBOL}  {INTERVAL}")
+    print(f"  Period      : {START_DATE}  →  {END_DATE}")
+    print(f"  Strategy    : {EMA_PERIOD} EMA × {SMA_PERIOD} SMA(EMA)")
+    print(f"  R:R         : 1 : {RISK_REWARD}   |  SL Buffer: {SL_BUFFER_PCT}%")
+    print(f"  Risk/Trade  : "
+          + (f"${RISK_FIXED_USD} fixed" if RISK_MODE == "fixed"
+             else f"{RISK_PCT}% of capital"))
+    print(f"  Start Cap   : ${start_cap:,.2f}")
+    print("─" * 48)
+    print(f"  Total Trades: {total}")
+    print(f"  Wins        : {wins}   ({win_rate:.1f}%)")
+    print(f"  Losses      : {losses}")
+    print(f"  Net P&L     : {'+'if net_pnl>=0 else ''}${net_pnl:,.2f}")
+    print(f"  Net R       : {'+'if net_r>=0 else ''}{net_r:.1f} R")
+    print(f"  Return      : {'+'if return_pct>=0 else ''}{return_pct:.2f}%")
+    print(f"  End Capital : ${end_cap:,.2f}")
+    print("─" * 48)
+    print(f"  Avg Win     : ${avg_win:,.2f}")
+    print(f"  Avg Loss    : ${avg_loss:,.2f}")
+    print(f"  Max Drawdown: {max_dd:.2f}%")
+    print("─" * 48)
 
 
-def save_equity_chart(trades: list[Trade], path: str = "equity_curve.png") -> None:
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-    except ImportError:
-        log.warning("matplotlib not installed — skipping chart. Run: pip install matplotlib")
-        return
+# ═══════════════════════ MAIN ══════════════════════════════════
 
-    closed = [t for t in trades if t.status != "CANCELLED"]
-    if not closed:
-        return
+def main():
+    print("╔══════════════════════════════════════════════╗")
+    print("║  SOL/USDT  9EMA × 9SMA(EMA)  Backtest       ║")
+    print("╚══════════════════════════════════════════════╝\n")
+    print(f"  Date range : {START_DATE}  →  {END_DATE}")
+    print(f"  Pair       : {SYMBOL}  |  Interval: {INTERVAL}\n")
 
-    dates  = [t.exited_at for t in closed]
-    equity = []
-    cum    = 0.0
-    for t in closed:
-        cum += t.pnl_pct
-        equity.append(cum)
+    start_ms = date_to_ms(START_DATE)
+    # end_ms = end of the END_DATE day
+    end_ms   = date_to_ms(END_DATE) + 86_400_000 - 1
 
-    # Build drawdown series
-    peak   = float("-inf")
-    dd     = []
-    for e in equity:
-        if e > peak:
-            peak = e
-        dd.append(peak - e)
+    # Fetch all candles
+    df = fetch_candles_range(SYMBOL, INTERVAL, start_ms, end_ms)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
-                                   gridspec_kw={"height_ratios": [3, 1]})
-    fig.suptitle(f"{SYMBOL} Renko Backtest — {LOOKBACK_DAYS}d of 3-min data\n"
-                 f"ATR-14 adaptive box | SL={SL_ATR_MULT}×ATR | TP={TP_SL_MULT}×SL",
-                 fontsize=13)
+    # Add indicators (same function as live script)
+    df = add_indicators(df)
 
-    # Equity curve
-    ax1.plot(dates, equity, color="#00c853", linewidth=1.5, label="Cumulative PnL %")
-    ax1.axhline(0, color="white", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax1.fill_between(dates, 0, equity,
-                     where=[e >= 0 for e in equity], alpha=0.15, color="#00c853")
-    ax1.fill_between(dates, 0, equity,
-                     where=[e < 0 for e in equity],  alpha=0.15, color="#ff1744")
-    ax1.set_ylabel("Cumulative PnL %", color="white")
-    ax1.tick_params(colors="white")
-    ax1.set_facecolor("#1a1a2e")
-    ax1.spines[:].set_color("#444")
-    ax1.legend(facecolor="#1a1a2e", labelcolor="white")
-    ax1.yaxis.grid(True, linestyle="--", alpha=0.3, color="#555")
+    # Run backtest
+    total, wins, losses, net_pnl, end_cap, trade_records, equity_curve = run_backtest(df)
 
-    # Drawdown
-    ax2.fill_between(dates, 0, [-d for d in dd], color="#ff1744", alpha=0.6)
-    ax2.set_ylabel("Drawdown %", color="white")
-    ax2.tick_params(colors="white")
-    ax2.set_facecolor("#1a1a2e")
-    ax2.spines[:].set_color("#444")
-    ax2.yaxis.grid(True, linestyle="--", alpha=0.3, color="#555")
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-    ax2.xaxis.set_major_locator(mdates.MonthLocator())
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right", color="white")
+    # Print summary
+    print_summary(total, wins, losses, net_pnl, CAPITAL, end_cap, trade_records)
 
-    fig.patch.set_facecolor("#0d0d1a")
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close()
-    log.info("Equity curve saved → %s", path)
+    # Save CSVs
+    save_trades(trade_records)
+    save_equity(equity_curve)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-async def main() -> None:
-    connector = aiohttp.TCPConnector(limit=5, ssl=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        candles = await fetch_all_klines(session, days=LOOKBACK_DAYS)
-
-    if len(candles) < SEED_CANDLES + ATR_PERIOD:
-        log.error("Not enough candles to run backtest.")
-        return
-
-    trades = run_backtest(candles)
-
-    print_summary(trades)
-    save_csv(trades, "backtest_results.csv")
-    save_equity_chart(trades, "equity_curve.png")
+    print("\n  Done.\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
