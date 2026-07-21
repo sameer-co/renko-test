@@ -19,7 +19,7 @@ OUTPUT:
 # ─────────────────────── CONFIG ───────────────────────────── #
 
 SYMBOL         = "SOLUSDT"          # Binance pair
-INTERVAL       = "2m"               # Candle interval
+INTERVAL       = "1m"               # Candle interval
 
 # ── Date range ───────────────────────────────────────────── #
 # Format: "YYYY-MM-DD"  (UTC midnight used automatically)
@@ -33,7 +33,7 @@ SL_BUFFER_PCT  = 0.20               # Buffer % added to raw SL distance
 RISK_REWARD    = 2.0                # TP = entry + SL_dist × RISK_REWARD
 
 # ── Position Sizing ──────────────────────────────────────── #
-RISK_MODE      = "fixed"            # "fixed" → flat USD | "percent" → % of capital
+RISK_MODE      = "percent"            # "fixed" → flat USD | "percent" → % of capital
 RISK_FIXED_USD = 100                # USD risked per trade (if RISK_MODE = "fixed")
 RISK_PCT       = 1.0                # % of capital risked  (if RISK_MODE = "percent")
 CAPITAL        = 10_000             # Starting capital
