@@ -23,8 +23,8 @@ INTERVAL       = "1m"               # Candle interval
 
 # ── Date range ───────────────────────────────────────────── #
 # Format: "YYYY-MM-DD"  (UTC midnight used automatically)
-START_DATE     = "2024-01-01"
-END_DATE       = "2024-03-31"
+START_DATE     = "2023-01-01"
+END_DATE       = "2025-03-31"
 
 EMA_PERIOD     = 9                  # Base EMA period
 SMA_PERIOD     = 9                  # SMA applied ON TOP of the EMA
