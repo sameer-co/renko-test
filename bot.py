@@ -19,7 +19,7 @@ OUTPUT:
 # ─────────────────────── CONFIG ───────────────────────────── #
 
 SYMBOL         = "SOLUSDT"          # Binance pair
-INTERVAL       = "1m"               # Candle interval
+INTERVAL       = "2m"               # Candle interval
 
 # ── Date range ───────────────────────────────────────────── #
 # Format: "YYYY-MM-DD"  (UTC midnight used automatically)
