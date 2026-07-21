@@ -2,7 +2,7 @@
 SOL/USDT Renko Back-Testing Script
 ====================================
 Exchange   : Binance public REST API (no API key needed)
-Data       : 1-minute candles, last 365 days (~525,600 bars)
+Data       : 3-minute candles, last 365 days (~175,200 bars)
 Box Size   : ATR-14 (adaptive — recalculated every closed candle, same as live bot)
 Buy Signal : First GREEN brick after a trend reversal (red → green)
 Stop-Loss  : 1.5 × ATR below entry
@@ -35,6 +35,9 @@ TP_SL_MULT      = 3.0          # take-profit distance = 3 × SL distance
 LOOKBACK_DAYS   = 365          # how many days of history to test
 SEED_CANDLES    = 200          # warm-up bars (excluded from trading)
 
+CANDLE_INTERVAL  = "3m"            # Binance interval string
+BARS_PER_DAY     = 480             # 1440 min/day ÷ 3 min = 480 bars/day
+
 BINANCE_REST_URL = "https://api.binance.com"
 MAX_CANDLES_PER_REQUEST = 1000  # Binance hard limit per call
 
@@ -44,7 +47,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("renko_backtest")
+log = logging.getLogger("renko_backtest_3m")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,14 +180,14 @@ class Trade:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHER  (paginated — handles 365 days of 1-min bars)
+# DATA FETCHER  (paginated — handles 365 days of 3-min bars)
 # ══════════════════════════════════════════════════════════════════════════════
 async def fetch_all_klines(session: aiohttp.ClientSession,
                            days: int = LOOKBACK_DAYS) -> list[dict]:
     """
-    Fetch 1-min candles for the past `days` days from Binance.
+    Fetch 3-min candles for the past `days` days from Binance.
     Binance caps at 1 000 candles per request, so we paginate.
-    Total bars ≈ days × 1440.
+    Total bars ≈ days × 480.
     """
     end_ms   = int(time.time() * 1000)
     start_ms = end_ms - days * 24 * 3600 * 1000
@@ -192,14 +195,14 @@ async def fetch_all_klines(session: aiohttp.ClientSession,
     url      = f"{BINANCE_REST_URL}/api/v3/klines"
     candles  = []
     cursor   = start_ms
-    total_expected = days * 1440
+    total_expected = days * BARS_PER_DAY
 
-    log.info("Downloading %d days of 1-min data (~%d bars) …", days, total_expected)
+    log.info("Downloading %d days of 3-min data (~%d bars) …", days, total_expected)
 
     while cursor < end_ms:
         params = {
             "symbol":    SYMBOL,
-            "interval":  "1m",
+            "interval":  CANDLE_INTERVAL,
             "startTime": cursor,
             "endTime":   end_ms,
             "limit":     MAX_CANDLES_PER_REQUEST,
@@ -224,7 +227,7 @@ async def fetch_all_klines(session: aiohttp.ClientSession,
         # Next page starts 1 ms after last candle open time
         cursor = int(raw[-1][0]) + 1
 
-        log.info("  Downloaded %d / ~%d candles …", len(candles), total_expected)
+        log.info("  Downloaded %d / ~%d candles (3m) …", len(candles), total_expected)
 
         # Polite rate-limit pause (Binance allows 1200 weight/min; each kline = 1)
         await asyncio.sleep(0.25)
@@ -377,7 +380,7 @@ def print_summary(trades: list[Trade]) -> None:
 
     bar = "═" * 50
     print(f"\n{bar}")
-    print(f"  RENKO BACKTEST RESULTS — {SYMBOL}  ({LOOKBACK_DAYS}d of 1-min data)")
+    print(f"  RENKO BACKTEST RESULTS — {SYMBOL}  ({LOOKBACK_DAYS}d of 3-min data)")
     print(bar)
     print(f"  Total trades      : {total}  (+{len(cancelled)} cancelled/open)")
     print(f"  Wins (TP hit)     : {len(wins)}")
@@ -459,7 +462,7 @@ def save_equity_chart(trades: list[Trade], path: str = "equity_curve.png") -> No
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
                                    gridspec_kw={"height_ratios": [3, 1]})
-    fig.suptitle(f"{SYMBOL} Renko Backtest — {LOOKBACK_DAYS}d of 1-min data\n"
+    fig.suptitle(f"{SYMBOL} Renko Backtest — {LOOKBACK_DAYS}d of 3-min data\n"
                  f"ATR-14 adaptive box | SL={SL_ATR_MULT}×ATR | TP={TP_SL_MULT}×SL",
                  fontsize=13)
 
