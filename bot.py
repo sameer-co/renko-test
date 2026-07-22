@@ -30,8 +30,8 @@ warnings.filterwarnings("ignore")
 ATR_PERIOD        = 14
 ATR_MULTIPLIER_SL = 1.5
 RR_RATIO          = 3.0          # TP = SL_distance * RR_RATIO
-PERIOD            = "730d"       # ~2 years (max for 1H on yfinance)
-INTERVAL          = "1h"
+PERIOD            = "3650d"       # ~2 years (max for 1H on yfinance)
+INTERVAL          = "1d"
 CAPITAL           = 100_000      # per-trade capital in INR
 DELAY_BETWEEN     = 1.5          # seconds between downloads (rate-limit safe)
 
