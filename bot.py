@@ -38,7 +38,7 @@ DELAY_BETWEEN     = 1.5          # seconds between downloads (rate-limit safe)
 # ─────────────────────────────────────────────
 # NIFTY 50 SYMBOLS  (NSE suffix)
 # ─────────────────────────────────────────────
-NIFTY_MIDCAP50 = [
+NIFTY50 = [
     "ASHOKLEY.NS","ASTRAL.NS","AUBANK.NS","AUROPHARMA.NS",
     "BALKRISIND.NS","BANDHANBNK.NS","BHARATFORG.NS","BHEL.NS",
     "BIOCON.NS","BSOFT.NS","COFORGE.NS","CONCOR.NS",
