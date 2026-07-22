@@ -2,3 +2,9 @@ aiohttp
 matplotlib
 requests
 pandas
+yfinance
+pandas
+numpy
+stocktrends
+tabulate
+openpyxl
