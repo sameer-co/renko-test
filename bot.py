@@ -1,336 +1,393 @@
 """
-=============================================================
-  NIFTY 50 — Renko Backtest (1H timeframe)
-=============================================================
-Strategy:
-  - Build ATR-14 based Renko chart from 1H OHLC data
-  - Entry: After a sell-side move (one or more red bricks),
-           wait for the FIRST completed GREEN brick → BUY
-  - SL  : Entry price - (ATR * 1.5)
-  - TP  : Entry price + (SL_distance * 3)   → RR = 1:3
-
-Requirements:
-  pip install yfinance pandas numpy stocktrends tabulate openpyxl
-=============================================================
+╔══════════════════════════════════════════════════════════════╗
+║        SOL Renko ATR Backtester — Binance Public API        ║
+║  Strategy : Buy first bullish Renko after sell-side move    ║
+║  SL       : 1.5x ATR below entry                           ║
+║  TP       : 3x SL (4.5x ATR) above entry                   ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
+import requests
 import time
-import warnings
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from stocktrends import Renko
-from tabulate import tabulate
+from datetime import datetime, timedelta
 
-warnings.filterwarnings("ignore")
+# ─────────────────────────────────────────────────────────────
+#  SETTINGS  ← edit everything here
+# ─────────────────────────────────────────────────────────────
+SETTINGS = {
+    "symbol"          : "SOLUSDT",
+    "timeframe"       : "5m",          # 1m 3m 5m 15m 30m 1h 4h 1d
+    "years"           : 1,             # how many years of data
+    "atr_period"      : 14,
+    "renko_mult"      : 1.0,           # brick size = renko_mult × ATR
+    "sl_mult"         : 1.5,           # SL = sl_mult × ATR
+    "tp_mult"         : 3.0,           # TP = tp_mult × SL
+    "capital"         : 1000,          # starting capital in USD
+    "fee_pct"         : 0.06,          # round-trip fee %
+    "min_sell_bricks" : 2,             # min consecutive bearish bricks before entry
+}
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-ATR_PERIOD        = 14
-ATR_MULTIPLIER_SL = 1.5
-RR_RATIO          = 3.0          # TP = SL_distance * RR_RATIO
-PERIOD            = "730d"       # ~2 years (max for 1H on yfinance)
-INTERVAL          = "1h"
-CAPITAL           = 100_000      # per-trade capital in INR
-DELAY_BETWEEN     = 1.5          # seconds between downloads (rate-limit safe)
-
-# ─────────────────────────────────────────────
-# NIFTY 50 SYMBOLS  (NSE suffix)
-# ─────────────────────────────────────────────
-NIFTY50 = [
-    "ASHOKLEY.NS","ASTRAL.NS","AUBANK.NS","AUROPHARMA.NS",
-    "BALKRISIND.NS","BANDHANBNK.NS","BHARATFORG.NS","BHEL.NS",
-    "BIOCON.NS","BSOFT.NS","COFORGE.NS","CONCOR.NS",
-    "CUMMINSIND.NS","DALBHARAT.NS","DIXON.NS","FEDERALBNK.NS",
-    "GLENMARK.NS","GODREJPROP.NS","IDFCFIRSTB.NS","INDIHOTEL.NS",
-    "INDUSTOWER.NS","IPCALAB.NS","JINDALSTEL.NS","JUBLFOOD.NS",
-    "KPITTECH.NS","LALPATHLAB.NS","LTTS.NS","LUPIN.NS",
-    "MAXHEALTH.NS","MFSL.NS","MPHASIS.NS","MUTHOOTFIN.NS",
-    "NATIONALUM.NS","NMDC.NS","OBEROIRLTY.NS","OFSS.NS",
-    "PERSISTENT.NS","PETRONET.NS","PFC.NS","POLYCAB.NS",
-    "RECLTD.NS","SAIL.NS","SRF.NS","SUPREMEIND.NS",
-    "SYNGENE.NS","TATACOMM.NS","TATELXSI.NS","TORNTPOWER.NS",
-    "TVSMOTOR.NS","VOLTAS.NS"
-]
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+LIMIT       = 1000   # max candles per request
 
 
-# ─────────────────────────────────────────────
-# HELPER: Compute ATR (Wilder / RMA)
-# ─────────────────────────────────────────────
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high  = df["High"]
-    low   = df["Low"]
-    close = df["Close"]
-    prev_close = close.shift(1)
+# ─────────────────────────────────────────────────────────────
+#  DATA FETCH
+# ─────────────────────────────────────────────────────────────
+def fetch_all_klines(symbol, interval, years):
+    end_ms   = int(time.time() * 1000)
+    start_ms = end_ms - int(years * 365.25 * 24 * 3600 * 1000)
+    all_data = []
+    cur      = start_ms
+    print(f"\n📡  Fetching {years}y of {symbol} {interval} from Binance…")
 
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs()
-    ], axis=1).max(axis=1)
+    while cur < end_ms:
+        params = {"symbol": symbol, "interval": interval,
+                  "startTime": cur, "endTime": end_ms, "limit": LIMIT}
+        r = requests.get(BINANCE_URL, params=params, timeout=15)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        all_data.extend(batch)
+        cur = batch[-1][0] + 1
+        pct = min(100, int((cur - start_ms) / (end_ms - start_ms) * 100))
+        print(f"    {pct:3d}%  ({len(all_data):,} candles)", end="\r")
+        if len(batch) < LIMIT:
+            break
+        time.sleep(0.3)
 
-    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    print(f"\n✅  {len(all_data):,} candles loaded")
+    df = pd.DataFrame(all_data, columns=[
+        "t","open","high","low","close","vol",
+        "ct","qvol","nt","tbvol","tqvol","_"])
+    df = df[["t","open","high","low","close"]].astype(
+        {"t": int, "open": float, "high": float, "low": float, "close": float})
+    df["date"] = pd.to_datetime(df["t"], unit="ms")
+    return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────
+#  ATR  (Wilder smoothing)
+# ─────────────────────────────────────────────────────────────
+def calc_atr(df, period):
+    hi, lo, cl = df["high"].values, df["low"].values, df["close"].values
+    tr  = np.zeros(len(df))
+    atr = np.zeros(len(df))
+    s   = 0.0
+    for i in range(1, len(df)):
+        tr[i] = max(hi[i] - lo[i],
+                    abs(hi[i] - cl[i-1]),
+                    abs(lo[i] - cl[i-1]))
+        if i < period:
+            s += tr[i]
+        elif i == period:
+            s += tr[i]
+            atr[i] = s / period
+        else:
+            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
     return atr
 
 
-# ─────────────────────────────────────────────
-# HELPER: Build ATR-Renko from OHLC
-# ─────────────────────────────────────────────
-def build_renko(df: pd.DataFrame, atr_val: float) -> pd.DataFrame | None:
-    """
-    Feed OHLC to stocktrends Renko.
-    Returns renko DataFrame with columns: date, open, high, low, close, uptrend
-    uptrend=True  → green brick
-    uptrend=False → red brick
-    """
-    renko_input = df[["Open", "High", "Low", "Close"]].copy().reset_index()
-    renko_input.columns = ["date", "open", "high", "low", "close"]
+# ─────────────────────────────────────────────────────────────
+#  RENKO BUILDER
+# ─────────────────────────────────────────────────────────────
+def build_renko(df, atr_arr, mult):
+    bricks = []
+    ref    = None
+    for i in range(len(df)):
+        a = atr_arr[i]
+        if a == 0:
+            continue
+        brick_sz = a * mult
+        if ref is None:
+            ref = df["close"].iat[i]
+            continue
+        price = df["close"].iat[i]
+        while price >= ref + brick_sz:
+            bricks.append({"dir": 1,  "open": ref, "close": ref + brick_sz,
+                           "idx": i,  "atr": a})
+            ref += brick_sz
+        while price <= ref - brick_sz:
+            bricks.append({"dir": -1, "open": ref, "close": ref - brick_sz,
+                           "idx": i,  "atr": a})
+            ref -= brick_sz
+    return bricks
 
-    # stocktrends also needs a volume column
-    renko_input["volume"] = 0
 
-    try:
-        r = Renko(renko_input)
-        r.brick_size = round(float(atr_val), 4)
-        renko_df = r.get_ohlc_data()
-        if renko_df is None or len(renko_df) < 3:
-            return None
-        return renko_df
-    except Exception:
-        return None
+# ─────────────────────────────────────────────────────────────
+#  STRATEGY
+# ─────────────────────────────────────────────────────────────
+def run_strategy(bricks, df, s):
+    sl_m   = s["sl_mult"]
+    tp_m   = s["tp_mult"]
+    min_sb = s["min_sell_bricks"]
+    fee    = s["fee_pct"] / 100
 
+    trades     = []
+    in_trade   = None
+    sell_count = 0
 
-# ─────────────────────────────────────────────
-# CORE: Backtest a single symbol
-# ─────────────────────────────────────────────
-def backtest_symbol(symbol: str) -> dict | None:
-    # 1. Download 1H data
-    raw = yf.download(symbol, period=PERIOD, interval=INTERVAL,
-                      progress=False, auto_adjust=True)
+    hi  = df["high"].values
+    lo  = df["low"].values
+    cl  = df["close"].values
+    dt  = df["date"].values
 
-    if raw is None or len(raw) < 50:
-        return None
+    for i in range(1, len(bricks)):
+        b    = bricks[i]
+        prev = bricks[i - 1]
 
-    # Flatten MultiIndex if present
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
+        # ── not in a trade ──────────────────────────────────
+        if in_trade is None:
+            if prev["dir"] == -1:
+                sell_count += 1
+            elif prev["dir"] == 1:
+                sell_count = 0
 
-    raw.dropna(inplace=True)
-    if len(raw) < 50:
-        return None
+            if b["dir"] == 1 and sell_count >= min_sb:
+                entry = b["close"]
+                sl    = entry - sl_m * b["atr"]
+                tp    = entry + tp_m * sl_m * b["atr"]
+                in_trade  = {"entry": entry, "sl": sl, "tp": tp,
+                             "atr": b["atr"], "ci": b["idx"],
+                             "date": dt[b["idx"]]}
+                sell_count = 0
 
-    # 2. Compute ATR on raw OHLC
-    atr_series = compute_atr(raw, ATR_PERIOD)
-    atr_val    = atr_series.dropna().median()   # use median for stable brick size
-    if np.isnan(atr_val) or atr_val <= 0:
-        return None
-
-    # 3. Build Renko
-    renko = build_renko(raw, atr_val)
-    if renko is None or len(renko) < 5:
-        return None
-
-    # 4. Simulate trades
-    trades       = []
-    in_trade     = False
-    sell_streak  = 0   # count consecutive red bricks
-
-    for i in range(1, len(renko)):
-        brick      = renko.iloc[i]
-        prev_brick = renko.iloc[i - 1]
-        is_green   = bool(brick["uptrend"])
-        is_red     = not is_green
-        was_red    = not bool(prev_brick["uptrend"])
-
-        if not in_trade:
-            # Track consecutive red bricks
-            if is_red:
-                sell_streak += 1
-            elif is_green and sell_streak >= 1:
-                # ─── ENTRY SIGNAL ───────────────────────────────────────
-                # After at least 1 red brick, first completed green brick
-                entry_price  = float(brick["close"])
-                sl_distance  = atr_val * ATR_MULTIPLIER_SL
-                sl           = entry_price - sl_distance
-                tp           = entry_price + sl_distance * RR_RATIO
-                entry_date   = brick["date"]
-
-                qty          = max(1, int(CAPITAL / entry_price))
-
-                in_trade    = True
-                sell_streak = 0
-
-                trade_info = {
-                    "entry_date"  : entry_date,
-                    "entry_price" : entry_price,
-                    "sl"          : sl,
-                    "tp"          : tp,
-                    "qty"         : qty,
-                    "exit_date"   : None,
-                    "exit_price"  : None,
-                    "result"      : None,
-                    "pnl"         : None,
-                }
-            else:
-                sell_streak = 0   # green appeared without prior red — reset
-
+        # ── in a trade: scan candles for exit ───────────────
         else:
-            # ─── TRADE MANAGEMENT ───────────────────────────────────────
-            # Check against remaining Renko bricks
-            cur_close = float(brick["close"])
-            cur_low   = float(brick["low"])
-            cur_high  = float(brick["high"])
+            entry = in_trade["entry"]
+            sl    = in_trade["sl"]
+            tp    = in_trade["tp"]
+            ci    = in_trade["ci"]
+            exit_p, reason = None, None
 
-            if cur_low <= trade_info["sl"]:
-                # Stop loss hit
-                trade_info["exit_date"]  = brick["date"]
-                trade_info["exit_price"] = trade_info["sl"]
-                trade_info["result"]     = "SL"
-                trade_info["pnl"]        = (trade_info["sl"] - trade_info["entry_price"]) * trade_info["qty"]
-                trades.append(trade_info)
-                in_trade = False
+            for ci2 in range(ci, len(df)):
+                if lo[ci2] <= sl:
+                    exit_p, reason = sl,       "SL"
+                    break
+                if hi[ci2] >= tp:
+                    exit_p, reason = tp,       "TP"
+                    break
 
-            elif cur_high >= trade_info["tp"]:
-                # Take profit hit
-                trade_info["exit_date"]  = brick["date"]
-                trade_info["exit_price"] = trade_info["tp"]
-                trade_info["result"]     = "TP"
-                trade_info["pnl"]        = (trade_info["tp"] - trade_info["entry_price"]) * trade_info["qty"]
-                trades.append(trade_info)
-                in_trade = False
+            if exit_p is None:
+                exit_p, reason = cl[-1], "EOD"
 
-    # Close any open trade at last price
-    if in_trade:
-        last = renko.iloc[-1]
-        trade_info["exit_date"]  = last["date"]
-        trade_info["exit_price"] = float(last["close"])
-        trade_info["result"]     = "OPEN"
-        trade_info["pnl"]        = (float(last["close"]) - trade_info["entry_price"]) * trade_info["qty"]
-        trades.append(trade_info)
-        in_trade = False
+            gross_pct = (exit_p - entry) / entry * 100
+            net_pct   = gross_pct - fee * 100
 
+            trades.append({
+                "date"       : pd.Timestamp(in_trade["date"]).strftime("%Y-%m-%d %H:%M"),
+                "entry"      : entry,
+                "sl"         : sl,
+                "tp"         : tp,
+                "exit"       : exit_p,
+                "reason"     : reason,
+                "atr"        : in_trade["atr"],
+                "gross_pct"  : gross_pct,
+                "net_pct"    : net_pct,
+                "win"        : net_pct > 0,
+            })
+            in_trade = None
+
+    return trades
+
+
+# ─────────────────────────────────────────────────────────────
+#  STATS
+# ─────────────────────────────────────────────────────────────
+def calc_stats(trades, capital, fee_pct):
     if not trades:
         return None
+    fee = fee_pct / 100
 
-    df_trades = pd.DataFrame(trades)
-    total     = len(df_trades)
-    wins      = (df_trades["result"] == "TP").sum()
-    losses    = (df_trades["result"] == "SL").sum()
-    open_t    = (df_trades["result"] == "OPEN").sum()
-    win_rate  = wins / total * 100 if total else 0
-    total_pnl = df_trades["pnl"].sum()
-    avg_win   = df_trades.loc[df_trades["result"] == "TP",  "pnl"].mean() if wins   else 0
-    avg_loss  = df_trades.loc[df_trades["result"] == "SL",  "pnl"].mean() if losses else 0
-    exp_factor= (avg_win * (win_rate/100) + avg_loss * (1 - win_rate/100)) if total else 0
+    wins   = [t for t in trades if t["win"]]
+    losses = [t for t in trades if not t["win"]]
+
+    win_rate = len(wins) / len(trades) * 100
+    avg_win  = np.mean([t["net_pct"] for t in wins])   if wins   else 0
+    avg_loss = np.mean([t["net_pct"] for t in losses]) if losses else 0
+    rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+    # ── fixed sizing ──────────────────────────────────────────
+    eq_f       = capital
+    peak_f     = capital
+    max_dd_f   = 0.0
+    gross_f    = 0.0
+    net_f      = 0.0
+    eq_f_curve = [capital]
+
+    for t in trades:
+        g = capital * t["gross_pct"] / 100
+        n = capital * t["net_pct"]   / 100
+        gross_f += g
+        net_f   += n
+        eq_f    += n
+        peak_f   = max(peak_f, eq_f)
+        dd       = (peak_f - eq_f) / peak_f * 100
+        max_dd_f = max(max_dd_f, dd)
+        eq_f_curve.append(eq_f)
+
+    # ── compounded sizing ─────────────────────────────────────
+    eq_c       = capital
+    peak_c     = capital
+    max_dd_c   = 0.0
+    gross_c    = 0.0
+    net_c      = 0.0
+    eq_c_curve = [capital]
+
+    for t in trades:
+        g = eq_c * t["gross_pct"] / 100
+        n = eq_c * t["net_pct"]   / 100
+        gross_c += g
+        net_c   += n
+        eq_c    += n
+        peak_c   = max(peak_c, eq_c)
+        dd       = (peak_c - eq_c) / peak_c * 100
+        max_dd_c = max(max_dd_c, dd)
+        eq_c_curve.append(eq_c)
 
     return {
-        "Symbol"      : symbol.replace(".NS", ""),
-        "Trades"      : total,
-        "Wins"        : int(wins),
-        "Losses"      : int(losses),
-        "Open"        : int(open_t),
-        "Win%"        : round(win_rate, 1),
-        "Total PnL"   : round(total_pnl, 2),
-        "Avg Win"     : round(avg_win,   2),
-        "Avg Loss"    : round(avg_loss,  2),
-        "Expectancy"  : round(exp_factor, 2),
-        "Brick Size"  : round(atr_val, 2),
-        "_trades"     : df_trades,
+        "total"    : len(trades),
+        "wins"     : len(wins),
+        "losses"   : len(losses),
+        "win_rate" : win_rate,
+        "avg_win"  : avg_win,
+        "avg_loss" : avg_loss,
+        "rr"       : rr,
+        "fixed"    : {
+            "gross_pnl" : gross_f,
+            "net_pnl"   : net_f,
+            "final_eq"  : eq_f,
+            "max_dd"    : max_dd_f,
+            "ret_pct"   : (eq_f - capital) / capital * 100,
+            "fee_drag"  : gross_f - net_f,
+        },
+        "comp"     : {
+            "gross_pnl" : gross_c,
+            "net_pnl"   : net_c,
+            "final_eq"  : eq_c,
+            "max_dd"    : max_dd_c,
+            "ret_pct"   : (eq_c - capital) / capital * 100,
+            "fee_drag"  : gross_c - net_c,
+        },
+        "eq_fixed_curve" : eq_f_curve,
+        "eq_comp_curve"  : eq_c_curve,
     }
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  PRINT REPORT
+# ─────────────────────────────────────────────────────────────
+def print_report(stats, settings, trades):
+    c = settings["capital"]
+    fee = settings["fee_pct"]
+    W = "\033[0m"; G = "\033[92m"; R = "\033[91m"
+    Y = "\033[93m"; B = "\033[94m"; BOLD = "\033[1m"
+
+    def usd(v):  return f"${v:>12,.2f}"
+    def pct(v):  return f"{v:>+8.2f}%"
+    def sep():   print(f"{Y}{'─'*60}{W}")
+
+    print(f"\n{BOLD}{B}{'═'*60}")
+    print(f"  SOL RENKO ATR BACKTEST RESULTS")
+    print(f"  {settings['symbol']} · {settings['timeframe']} · {settings['years']}y")
+    print(f"{'═'*60}{W}")
+
+    sep()
+    print(f"  {'TRADE SUMMARY':30}")
+    sep()
+    print(f"  Total Trades        : {BOLD}{stats['total']}{W}")
+    print(f"  Wins                : {G}{stats['wins']}{W}")
+    print(f"  Losses              : {R}{stats['losses']}{W}")
+    print(f"  Win Rate            : {BOLD}{stats['win_rate']:.2f}%{W}")
+    print(f"  Avg Win             : {G}{stats['avg_win']:+.2f}%{W}")
+    print(f"  Avg Loss            : {R}{stats['avg_loss']:+.2f}%{W}")
+    print(f"  Risk : Reward       : 1 : {stats['rr']:.2f}")
+
+    for label, key in [("FIXED SIZING", "fixed"), ("COMPOUNDED SIZING", "comp")]:
+        st = stats[key]
+        sep()
+        print(f"  {label:30}  (capital: ${c:,.0f})")
+        sep()
+        col = G if st["gross_pnl"] >= 0 else R
+        print(f"  Gross P&L           : {col}{usd(st['gross_pnl'])}{W}   (before fees)")
+        col = G if st["net_pnl"] >= 0 else R
+        print(f"  Net   P&L           : {col}{usd(st['net_pnl'])}{W}   (after {fee}% fee)")
+        col = G if st["final_eq"] >= c else R
+        print(f"  Final Equity        : {col}{usd(st['final_eq'])}{W}")
+        print(f"  Total Return        : {(G if st['ret_pct']>=0 else R)}{pct(st['ret_pct'])}{W}")
+        print(f"  Max Drawdown        : {R}{st['max_dd']:>8.2f}%{W}")
+        print(f"  Fee Drag            : {Y}{usd(st['fee_drag'])}{W}")
+
+    sep()
+    print(f"  FEE IMPACT SUMMARY")
+    sep()
+    print(f"  Fee per round trip  : {fee}%")
+    print(f"  Total fees (fixed)  : {Y}{usd(stats['fixed']['fee_drag'])}{W}")
+    print(f"  Total fees (comp)   : {Y}{usd(stats['comp']['fee_drag'])}{W}")
+    print(f"  Trades × fee        : {stats['total']} × {fee}% = {stats['total']*fee:.2f}%")
+    sep()
+
+    # trade log (last 20)
+    print(f"\n  Last 20 Trades:")
+    print(f"  {'#':>4}  {'Date':<17}  {'Entry':>8}  {'SL':>8}  {'TP':>8}  "
+          f"{'Exit':>8}  {'Why':<9}  {'Gross':>7}  {'Net':>7}  {'Result'}")
+    print(f"  {'─'*100}")
+    for i, t in enumerate(trades[-20:], start=max(1, len(trades)-19)):
+        res = f"{G}WIN{W}" if t["win"] else f"{R}LOSS{W}"
+        gc  = G if t["gross_pct"] >= 0 else R
+        nc  = G if t["net_pct"]   >= 0 else R
+        print(f"  {i:>4}  {t['date']:<17}  {t['entry']:>8.3f}  {t['sl']:>8.3f}  "
+              f"{t['tp']:>8.3f}  {t['exit']:>8.3f}  {t['reason']:<9}  "
+              f"{gc}{t['gross_pct']:>+6.2f}%{W}  {nc}{t['net_pct']:>+6.2f}%{W}  {res}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  SAVE CSV
+# ─────────────────────────────────────────────────────────────
+def save_csv(trades, stats, settings):
+    df = pd.DataFrame(trades)
+    fname = f"backtest_{settings['symbol']}_{settings['timeframe']}.csv"
+    df.to_csv(fname, index=False)
+    print(f"\n💾  Trade log saved → {fname}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────
 def main():
-    print("=" * 65)
-    print("  NIFTY 50  |  Renko Backtest  |  1H  |  ATR-14  |  RR 1:3")
-    print("=" * 65)
-    print(f"  Universe  : {len(NIFTY50)} stocks")
-    print(f"  Period    : Last 2 years (730d)")
-    print(f"  Entry     : First green Renko brick after sell-side move")
-    print(f"  SL        : Entry - ATR × {ATR_MULTIPLIER_SL}")
-    print(f"  TP        : Entry + SL_dist × {RR_RATIO}  (1:{int(RR_RATIO)} RR)")
-    print("=" * 65, "\n")
+    s = SETTINGS
+    print(__doc__)
+    print(f"  Symbol     : {s['symbol']}")
+    print(f"  Timeframe  : {s['timeframe']}")
+    print(f"  Years      : {s['years']}")
+    print(f"  ATR period : {s['atr_period']}")
+    print(f"  Brick size : {s['renko_mult']}× ATR")
+    print(f"  SL         : {s['sl_mult']}× ATR")
+    print(f"  TP         : {s['tp_mult']}× SL  ({s['tp_mult']*s['sl_mult']}× ATR)")
+    print(f"  Capital    : ${s['capital']:,}")
+    print(f"  Fee        : {s['fee_pct']}% round trip")
 
-    summary     = []
-    all_trades  = []
-    failed      = []
+    df      = fetch_all_klines(s["symbol"], s["timeframe"], s["years"])
+    atr_arr = calc_atr(df, s["atr_period"])
 
-    for idx, sym in enumerate(NIFTY50, 1):
-        print(f"[{idx:2d}/{len(NIFTY50)}] Fetching {sym:<20}", end=" ", flush=True)
-        try:
-            result = backtest_symbol(sym)
-            if result:
-                trades_df          = result.pop("_trades")
-                trades_df["Symbol"] = result["Symbol"]
-                all_trades.append(trades_df)
-                summary.append(result)
-                print(f"✓  trades={result['Trades']}  Win%={result['Win%']}%  PnL=₹{result['Total PnL']:,.0f}")
-            else:
-                failed.append(sym)
-                print("✗  insufficient data")
-        except Exception as e:
-            failed.append(sym)
-            print(f"✗  error: {e}")
+    print(f"🧱  Building Renko bricks (mult={s['renko_mult']}×ATR)…")
+    bricks  = build_renko(df, atr_arr, s["renko_mult"])
+    print(f"    {len(bricks):,} bricks built")
 
-        time.sleep(DELAY_BETWEEN)
+    print(f"⚡  Running strategy…")
+    trades  = run_strategy(bricks, df, s)
+    print(f"    {len(trades):,} trades found")
 
-    if not summary:
-        print("\n❌  No results — check your internet connection.")
+    stats   = calc_stats(trades, s["capital"], s["fee_pct"])
+    if stats is None:
+        print("❌  No trades generated. Try adjusting settings.")
         return
 
-    # ─── Build summary DF ───────────────────────────────────────
-    df_summary = pd.DataFrame(summary).sort_values("Total PnL", ascending=False).reset_index(drop=True)
-    df_all_trades = pd.concat(all_trades, ignore_index=True)
-
-    # ─── Portfolio aggregate ─────────────────────────────────────
-    total_trades = df_summary["Trades"].sum()
-    total_wins   = df_summary["Wins"].sum()
-    total_losses = df_summary["Losses"].sum()
-    overall_wr   = total_wins / total_trades * 100 if total_trades else 0
-    overall_pnl  = df_summary["Total PnL"].sum()
-
-    print("\n" + "=" * 65)
-    print("  PORTFOLIO SUMMARY")
-    print("=" * 65)
-    print(f"  Stocks backtested : {len(summary)}")
-    print(f"  Stocks failed     : {len(failed)}")
-    print(f"  Total Trades      : {total_trades}")
-    print(f"  Total Wins (TP)   : {total_wins}")
-    print(f"  Total Losses (SL) : {total_losses}")
-    print(f"  Overall Win Rate  : {overall_wr:.1f}%")
-    print(f"  Total Net PnL     : ₹{overall_pnl:,.2f}")
-    print("=" * 65)
-
-    # ─── Top / Bottom performers ─────────────────────────────────
-    print("\n📈  TOP 10 PERFORMERS (by Total PnL):")
-    top10 = df_summary.head(10)[["Symbol","Trades","Win%","Total PnL","Expectancy","Brick Size"]]
-    print(tabulate(top10, headers="keys", tablefmt="rounded_outline", showindex=False,
-                   floatfmt=("", "", ".1f", ",.2f", ".2f", ".2f")))
-
-    print("\n📉  BOTTOM 10 PERFORMERS:")
-    bot10 = df_summary.tail(10)[["Symbol","Trades","Win%","Total PnL","Expectancy","Brick Size"]]
-    print(tabulate(bot10, headers="keys", tablefmt="rounded_outline", showindex=False,
-                   floatfmt=("", "", ".1f", ",.2f", ".2f", ".2f")))
-
-    # ─── Save to Excel ───────────────────────────────────────────
-    out_file = "nifty50_renko_results.xlsx"
-    with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
-        df_summary.to_excel(writer, sheet_name="Summary", index=False)
-        df_all_trades.to_excel(writer, sheet_name="All Trades", index=False)
-
-        # Per-symbol sheets
-        for sym_row in summary:
-            sym_name = sym_row["Symbol"]
-            sym_df   = df_all_trades[df_all_trades["Symbol"] == sym_name].copy()
-            sheet    = sym_name[:31]   # Excel sheet name limit
-            sym_df.to_excel(writer, sheet_name=sheet, index=False)
-
-    print(f"\n✅  Results saved to: {out_file}")
-    if failed:
-        print(f"⚠️   Skipped ({len(failed)} stocks): {', '.join(s.replace('.NS','') for s in failed)}")
+    print_report(stats, s, trades)
+    save_csv(trades, stats, s)
 
 
 if __name__ == "__main__":
