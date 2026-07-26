@@ -25,7 +25,7 @@ SETTINGS = {
     "sl_mult"         : 1.5,           # SL = sl_mult × ATR
     "tp_mult"         : 3.0,           # TP = tp_mult × SL
     "capital"         : 1000,          # starting capital in USD
-    "fee_pct"         : 0.06,          # round-trip fee %
+    "fee_pct"         : 0.1,          # round-trip fee %
     "min_sell_bricks" : 2,             # min consecutive bearish bricks before entry
 }
 
