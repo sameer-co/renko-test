@@ -93,32 +93,67 @@ def calc_atr(df, period):
 
 # ─────────────────────────────────────────────────────────────
 #  RENKO BUILDER
+#
+#  FIX: Brick size is now locked to the ATR at the moment the
+#       brick OPENS (ref_atr), not the current bar's ATR.
+#       This prevents the brick size from changing mid-sequence,
+#       which is how Renko actually works.
 # ─────────────────────────────────────────────────────────────
 def build_renko(df, atr_arr, mult):
-    bricks = []
-    ref    = None
+    bricks  = []
+    ref     = None
+    ref_atr = None   # ATR locked when the current level was set
+
     for i in range(len(df)):
         a = atr_arr[i]
         if a == 0:
             continue
-        brick_sz = a * mult
+
         if ref is None:
-            ref = df["close"].iat[i]
+            ref     = df["close"].iat[i]
+            ref_atr = a
             continue
-        price = df["close"].iat[i]
+
+        price    = df["close"].iat[i]
+        brick_sz = ref_atr * mult   # use locked ATR, not current bar's ATR
+
         while price >= ref + brick_sz:
             bricks.append({"dir": 1,  "open": ref, "close": ref + brick_sz,
-                           "idx": i,  "atr": a})
-            ref += brick_sz
+                           "idx": i,  "atr": ref_atr})
+            ref     += brick_sz
+            ref_atr  = a            # lock new ATR for next brick
+            brick_sz = ref_atr * mult
+
         while price <= ref - brick_sz:
             bricks.append({"dir": -1, "open": ref, "close": ref - brick_sz,
-                           "idx": i,  "atr": a})
-            ref -= brick_sz
+                           "idx": i,  "atr": ref_atr})
+            ref     -= brick_sz
+            ref_atr  = a
+            brick_sz = ref_atr * mult
+
     return bricks
 
 
 # ─────────────────────────────────────────────────────────────
 #  STRATEGY
+#
+#  FIXES applied:
+#  1. sell_count now correctly counts consecutive bearish bricks
+#     using the current brick's direction, not prev's.  The
+#     previous code checked prev["dir"] but then entered on
+#     b["dir"]==1, meaning the sequence was always one brick
+#     short (the triggering bullish brick was counted in the
+#     sell run by looking at prev).
+#
+#  2. Exit scan starts at ci + 1 (the candle AFTER entry fills)
+#     to avoid a same-bar lookahead that could falsely trigger
+#     SL/TP on the entry candle itself.
+#
+#  3. sell_count is no longer silently lost while in a trade.
+#     It is explicitly reset to 0 when a trade opens, and
+#     accumulation only happens when flat — which was the
+#     original intent but was broken because the in-trade
+#     branch fell through without touching sell_count.
 # ─────────────────────────────────────────────────────────────
 def run_strategy(bricks, df, s):
     sl_m   = s["sl_mult"]
@@ -135,40 +170,49 @@ def run_strategy(bricks, df, s):
     cl  = df["close"].values
     dt  = df["date"].values
 
-    for i in range(1, len(bricks)):
-        b    = bricks[i]
-        prev = bricks[i - 1]
+    for i in range(len(bricks)):
+        b = bricks[i]
 
         # ── not in a trade ──────────────────────────────────
         if in_trade is None:
-            if prev["dir"] == -1:
-                sell_count += 1
-            elif prev["dir"] == 1:
-                sell_count = 0
 
-            if b["dir"] == 1 and sell_count >= min_sb:
-                entry = b["close"]
-                sl    = entry - sl_m * b["atr"]
-                tp    = entry + tp_m * sl_m * b["atr"]
-                in_trade  = {"entry": entry, "sl": sl, "tp": tp,
-                             "atr": b["atr"], "ci": b["idx"],
-                             "date": dt[b["idx"]]}
+            # FIX 1: count using the CURRENT brick direction
+            if b["dir"] == -1:
+                sell_count += 1
+            else:
+                # current brick is bullish — check for entry signal
+                if sell_count >= min_sb:
+                    entry = b["close"]
+                    sl    = entry - sl_m * b["atr"]
+                    tp    = entry + tp_m * sl_m * b["atr"]
+                    in_trade  = {
+                        "entry" : entry,
+                        "sl"    : sl,
+                        "tp"    : tp,
+                        "atr"   : b["atr"],
+                        "ci"    : b["idx"],
+                        "date"  : dt[b["idx"]],
+                    }
+                # reset regardless — bullish brick breaks any bearish run
                 sell_count = 0
 
         # ── in a trade: scan candles for exit ───────────────
         else:
-            entry = in_trade["entry"]
-            sl    = in_trade["sl"]
-            tp    = in_trade["tp"]
-            ci    = in_trade["ci"]
+            entry  = in_trade["entry"]
+            sl     = in_trade["sl"]
+            tp     = in_trade["tp"]
+            ci     = in_trade["ci"]
             exit_p, reason = None, None
 
-            for ci2 in range(ci, len(df)):
+            # FIX 2: start from ci + 1 to avoid same-bar lookahead
+            scan_start = min(ci + 1, len(df) - 1)
+
+            for ci2 in range(scan_start, len(df)):
                 if lo[ci2] <= sl:
-                    exit_p, reason = sl,       "SL"
+                    exit_p, reason = sl,    "SL"
                     break
                 if hi[ci2] >= tp:
-                    exit_p, reason = tp,       "TP"
+                    exit_p, reason = tp,    "TP"
                     break
 
             if exit_p is None:
@@ -178,18 +222,19 @@ def run_strategy(bricks, df, s):
             net_pct   = gross_pct - fee * 100
 
             trades.append({
-                "date"       : pd.Timestamp(in_trade["date"]).strftime("%Y-%m-%d %H:%M"),
-                "entry"      : entry,
-                "sl"         : sl,
-                "tp"         : tp,
-                "exit"       : exit_p,
-                "reason"     : reason,
-                "atr"        : in_trade["atr"],
-                "gross_pct"  : gross_pct,
-                "net_pct"    : net_pct,
-                "win"        : net_pct > 0,
+                "date"      : pd.Timestamp(in_trade["date"]).strftime("%Y-%m-%d %H:%M"),
+                "entry"     : entry,
+                "sl"        : sl,
+                "tp"        : tp,
+                "exit"      : exit_p,
+                "reason"    : reason,
+                "atr"       : in_trade["atr"],
+                "gross_pct" : gross_pct,
+                "net_pct"   : net_pct,
+                "win"       : net_pct > 0,
             })
-            in_trade = None
+            in_trade   = None
+            sell_count = 0   # FIX 3: clean slate after every exit
 
     return trades
 
@@ -200,15 +245,14 @@ def run_strategy(bricks, df, s):
 def calc_stats(trades, capital, fee_pct):
     if not trades:
         return None
-    fee = fee_pct / 100
 
     wins   = [t for t in trades if t["win"]]
     losses = [t for t in trades if not t["win"]]
 
     win_rate = len(wins) / len(trades) * 100
-    avg_win  = np.mean([t["net_pct"] for t in wins])   if wins   else 0
-    avg_loss = np.mean([t["net_pct"] for t in losses]) if losses else 0
-    rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    avg_win  = np.mean([t["net_pct"] for t in wins])   if wins   else 0.0
+    avg_loss = np.mean([t["net_pct"] for t in losses]) if losses else 0.0
+    rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
 
     # ── fixed sizing ──────────────────────────────────────────
     eq_f       = capital
@@ -281,14 +325,14 @@ def calc_stats(trades, capital, fee_pct):
 #  PRINT REPORT
 # ─────────────────────────────────────────────────────────────
 def print_report(stats, settings, trades):
-    c = settings["capital"]
+    c   = settings["capital"]
     fee = settings["fee_pct"]
     W = "\033[0m"; G = "\033[92m"; R = "\033[91m"
     Y = "\033[93m"; B = "\033[94m"; BOLD = "\033[1m"
 
-    def usd(v):  return f"${v:>12,.2f}"
-    def pct(v):  return f"{v:>+8.2f}%"
-    def sep():   print(f"{Y}{'─'*60}{W}")
+    def usd(v): return f"${v:>12,.2f}"
+    def pct(v): return f"{v:>+8.2f}%"
+    def sep():  print(f"{Y}{'─'*60}{W}")
 
     print(f"\n{BOLD}{B}{'═'*60}")
     print(f"  SOL RENKO ATR BACKTEST RESULTS")
