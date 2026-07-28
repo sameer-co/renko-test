@@ -11,7 +11,6 @@ import requests
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────────────────────
 #  SETTINGS  ← edit everything here
@@ -19,11 +18,11 @@ from datetime import datetime, timedelta
 SETTINGS = {
     "symbol"          : "SOLUSDT",
     "timeframe"       : "5m",          # 1m 3m 5m 15m 30m 1h 4h 1d
-    "years"           : 15,             # how many years of data
+    "years"           : 15,            # how many years of data
     "atr_period"      : 14,
     "renko_mult"      : 1.0,           # brick size = renko_mult × ATR
-    "sl_mult"         : 1.5,           # SL = sl_mult × ATR
-    "tp_mult"         : 3.0,           # TP = tp_mult × SL
+    "sl_mult"         : 1.5,           # SL = sl_mult × ATR below entry
+    "tp_mult"         : 3.0,           # TP = tp_mult × SL above entry
     "capital"         : 1000,          # starting capital in USD
     "fee_pct"         : 0.06,          # round-trip fee %
     "min_sell_bricks" : 2,             # min consecutive bearish bricks before entry
@@ -93,40 +92,36 @@ def calc_atr(df, period):
 
 # ─────────────────────────────────────────────────────────────
 #  RENKO BUILDER
-#
-#  FIX: Brick size is now locked to the ATR at the moment the
-#       brick OPENS (ref_atr), not the current bar's ATR.
-#       This prevents the brick size from changing mid-sequence,
-#       which is how Renko actually works.
+#  Brick size is locked to the ATR when the brick OPENS so the
+#  size cannot shift mid-sequence on a single candle.
 # ─────────────────────────────────────────────────────────────
 def build_renko(df, atr_arr, mult):
     bricks  = []
     ref     = None
-    ref_atr = None   # ATR locked when the current level was set
+    ref_atr = None
 
     for i in range(len(df)):
         a = atr_arr[i]
         if a == 0:
             continue
-
         if ref is None:
             ref     = df["close"].iat[i]
             ref_atr = a
             continue
 
         price    = df["close"].iat[i]
-        brick_sz = ref_atr * mult   # use locked ATR, not current bar's ATR
+        brick_sz = ref_atr * mult
 
         while price >= ref + brick_sz:
-            bricks.append({"dir": 1,  "open": ref, "close": ref + brick_sz,
-                           "idx": i,  "atr": ref_atr})
+            bricks.append({"dir": 1, "open": ref, "close": ref + brick_sz,
+                           "idx": i, "atr": ref_atr})
             ref     += brick_sz
-            ref_atr  = a            # lock new ATR for next brick
+            ref_atr  = a
             brick_sz = ref_atr * mult
 
         while price <= ref - brick_sz:
             bricks.append({"dir": -1, "open": ref, "close": ref - brick_sz,
-                           "idx": i,  "atr": ref_atr})
+                           "idx": i, "atr": ref_atr})
             ref     -= brick_sz
             ref_atr  = a
             brick_sz = ref_atr * mult
@@ -137,89 +132,93 @@ def build_renko(df, atr_arr, mult):
 # ─────────────────────────────────────────────────────────────
 #  STRATEGY
 #
-#  FIXES applied:
-#  1. sell_count now correctly counts consecutive bearish bricks
-#     using the current brick's direction, not prev's.  The
-#     previous code checked prev["dir"] but then entered on
-#     b["dir"]==1, meaning the sequence was always one brick
-#     short (the triggering bullish brick was counted in the
-#     sell run by looking at prev).
+#  KEY DESIGN: the exit scan is bounded to candles between the
+#  entry candle (ci_entry + 1) and the NEXT brick's candle
+#  index (b_next["idx"]).  This prevents looking into the
+#  future beyond what a real-time system would have seen.
 #
-#  2. Exit scan starts at ci + 1 (the candle AFTER entry fills)
-#     to avoid a same-bar lookahead that could falsely trigger
-#     SL/TP on the entry candle itself.
-#
-#  3. sell_count is no longer silently lost while in a trade.
-#     It is explicitly reset to 0 when a trade opens, and
-#     accumulation only happens when flat — which was the
-#     original intent but was broken because the in-trade
-#     branch fell through without touching sell_count.
+#  Trade lifecycle:
+#   OPEN  : when a bullish brick closes after ≥ min_sell_bricks
+#            consecutive bearish bricks.  Entry = brick close.
+#   CHECK : on every subsequent brick, scan candles from the
+#            last-checked candle up to this brick's candle to
+#            see if SL or TP was hit.
+#   CLOSE : first candle where lo ≤ SL  → exit at SL
+#           first candle where hi ≥ TP  → exit at TP
+#           end of dataset               → exit at last close
 # ─────────────────────────────────────────────────────────────
 def run_strategy(bricks, df, s):
     sl_m   = s["sl_mult"]
     tp_m   = s["tp_mult"]
     min_sb = s["min_sell_bricks"]
-    fee    = s["fee_pct"] / 100
+    fee_rt = s["fee_pct"] / 100   # round-trip fee as a fraction
 
     trades     = []
     in_trade   = None
     sell_count = 0
+    scan_from  = 0   # next candle index to scan for SL/TP
 
-    hi  = df["high"].values
-    lo  = df["low"].values
-    cl  = df["close"].values
-    dt  = df["date"].values
+    hi = df["high"].values
+    lo = df["low"].values
+    cl = df["close"].values
+    dt = df["date"].values
+    n  = len(df)
 
     for i in range(len(bricks)):
         b = bricks[i]
 
         # ── not in a trade ──────────────────────────────────
         if in_trade is None:
-
-            # FIX 1: count using the CURRENT brick direction
             if b["dir"] == -1:
                 sell_count += 1
             else:
-                # current brick is bullish — check for entry signal
+                # bullish brick — check entry condition
                 if sell_count >= min_sb:
-                    entry = b["close"]
-                    sl    = entry - sl_m * b["atr"]
-                    tp    = entry + tp_m * sl_m * b["atr"]
+                    entry     = b["close"]
+                    sl        = entry - sl_m * b["atr"]
+                    tp        = entry + tp_m * sl_m * b["atr"]
                     in_trade  = {
                         "entry" : entry,
                         "sl"    : sl,
                         "tp"    : tp,
                         "atr"   : b["atr"],
-                        "ci"    : b["idx"],
                         "date"  : dt[b["idx"]],
                     }
-                # reset regardless — bullish brick breaks any bearish run
-                sell_count = 0
+                    # start scanning from the candle AFTER entry
+                    scan_from = b["idx"] + 1
+                sell_count = 0   # bullish brick always resets run
 
-        # ── in a trade: scan candles for exit ───────────────
+        # ── in a trade: check candles up to THIS brick ──────
         else:
-            entry  = in_trade["entry"]
-            sl     = in_trade["sl"]
-            tp     = in_trade["tp"]
-            ci     = in_trade["ci"]
+            entry = in_trade["entry"]
+            sl    = in_trade["sl"]
+            tp    = in_trade["tp"]
+
+            # scan only candles we haven't checked yet,
+            # up to (and including) the current brick's candle
+            scan_to   = min(b["idx"] + 1, n)   # exclusive upper bound
             exit_p, reason = None, None
 
-            # FIX 2: start from ci + 1 to avoid same-bar lookahead
-            scan_start = min(ci + 1, len(df) - 1)
+            for ci in range(scan_from, scan_to):
+                if lo[ci] <= sl:
+                    exit_p, reason = sl, "SL"
+                    break
+                if hi[ci] >= tp:
+                    exit_p, reason = tp, "TP"
+                    break
 
-            for ci2 in range(scan_start, len(df)):
-                if lo[ci2] <= sl:
-                    exit_p, reason = sl,    "SL"
-                    break
-                if hi[ci2] >= tp:
-                    exit_p, reason = tp,    "TP"
-                    break
+            # advance scan cursor regardless of exit
+            scan_from = scan_to
 
             if exit_p is None:
-                exit_p, reason = cl[-1], "EOD"
+                # no exit yet — trade still open, wait for next brick
+                continue
 
+            # ── record closed trade ─────────────────────────
             gross_pct = (exit_p - entry) / entry * 100
-            net_pct   = gross_pct - fee * 100
+            # fee_rt is already a fraction (e.g. 0.0006)
+            # multiply by 100 to express in %, subtract from gross %
+            net_pct   = gross_pct - fee_rt * 100
 
             trades.append({
                 "date"      : pd.Timestamp(in_trade["date"]).strftime("%Y-%m-%d %H:%M"),
@@ -234,7 +233,26 @@ def run_strategy(bricks, df, s):
                 "win"       : net_pct > 0,
             })
             in_trade   = None
-            sell_count = 0   # FIX 3: clean slate after every exit
+            sell_count = 0
+
+    # ── close any still-open trade at last price ────────────
+    if in_trade is not None:
+        entry     = in_trade["entry"]
+        exit_p    = cl[-1]
+        gross_pct = (exit_p - entry) / entry * 100
+        net_pct   = gross_pct - fee_rt * 100
+        trades.append({
+            "date"      : pd.Timestamp(in_trade["date"]).strftime("%Y-%m-%d %H:%M"),
+            "entry"     : entry,
+            "sl"        : in_trade["sl"],
+            "tp"        : in_trade["tp"],
+            "exit"      : exit_p,
+            "reason"    : "EOD",
+            "atr"       : in_trade["atr"],
+            "gross_pct" : gross_pct,
+            "net_pct"   : net_pct,
+            "win"       : net_pct > 0,
+        })
 
     return trades
 
@@ -254,7 +272,7 @@ def calc_stats(trades, capital, fee_pct):
     avg_loss = np.mean([t["net_pct"] for t in losses]) if losses else 0.0
     rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
 
-    # ── fixed sizing ──────────────────────────────────────────
+    # ── fixed sizing (always bet on base capital) ─────────────
     eq_f       = capital
     peak_f     = capital
     max_dd_f   = 0.0
@@ -269,11 +287,11 @@ def calc_stats(trades, capital, fee_pct):
         net_f   += n
         eq_f    += n
         peak_f   = max(peak_f, eq_f)
-        dd       = (peak_f - eq_f) / peak_f * 100
+        dd       = (peak_f - eq_f) / peak_f * 100 if peak_f > 0 else 0.0
         max_dd_f = max(max_dd_f, dd)
         eq_f_curve.append(eq_f)
 
-    # ── compounded sizing ─────────────────────────────────────
+    # ── compounded sizing (bet on current equity) ─────────────
     eq_c       = capital
     peak_c     = capital
     max_dd_c   = 0.0
@@ -288,7 +306,7 @@ def calc_stats(trades, capital, fee_pct):
         net_c   += n
         eq_c    += n
         peak_c   = max(peak_c, eq_c)
-        dd       = (peak_c - eq_c) / peak_c * 100
+        dd       = (peak_c - eq_c) / peak_c * 100 if peak_c > 0 else 0.0
         max_dd_c = max(max_dd_c, dd)
         eq_c_curve.append(eq_c)
 
@@ -327,8 +345,12 @@ def calc_stats(trades, capital, fee_pct):
 def print_report(stats, settings, trades):
     c   = settings["capital"]
     fee = settings["fee_pct"]
-    W = "\033[0m"; G = "\033[92m"; R = "\033[91m"
-    Y = "\033[93m"; B = "\033[94m"; BOLD = "\033[1m"
+    W    = "\033[0m"
+    G    = "\033[92m"
+    R    = "\033[91m"
+    Y    = "\033[93m"
+    B    = "\033[94m"
+    BOLD = "\033[1m"
 
     def usd(v): return f"${v:>12,.2f}"
     def pct(v): return f"{v:>+8.2f}%"
@@ -340,20 +362,20 @@ def print_report(stats, settings, trades):
     print(f"{'═'*60}{W}")
 
     sep()
-    print(f"  {'TRADE SUMMARY':30}")
+    print(f"  TRADE SUMMARY")
     sep()
     print(f"  Total Trades        : {BOLD}{stats['total']}{W}")
     print(f"  Wins                : {G}{stats['wins']}{W}")
     print(f"  Losses              : {R}{stats['losses']}{W}")
     print(f"  Win Rate            : {BOLD}{stats['win_rate']:.2f}%{W}")
-    print(f"  Avg Win             : {G}{stats['avg_win']:+.2f}%{W}")
-    print(f"  Avg Loss            : {R}{stats['avg_loss']:+.2f}%{W}")
+    print(f"  Avg Win  (net)      : {G}{stats['avg_win']:+.2f}%{W}")
+    print(f"  Avg Loss (net)      : {R}{stats['avg_loss']:+.2f}%{W}")
     print(f"  Risk : Reward       : 1 : {stats['rr']:.2f}")
 
     for label, key in [("FIXED SIZING", "fixed"), ("COMPOUNDED SIZING", "comp")]:
         st = stats[key]
         sep()
-        print(f"  {label:30}  (capital: ${c:,.0f})")
+        print(f"  {label}  (capital: ${c:,.0f})")
         sep()
         col = G if st["gross_pnl"] >= 0 else R
         print(f"  Gross P&L           : {col}{usd(st['gross_pnl'])}{W}   (before fees)")
@@ -361,7 +383,8 @@ def print_report(stats, settings, trades):
         print(f"  Net   P&L           : {col}{usd(st['net_pnl'])}{W}   (after {fee}% fee)")
         col = G if st["final_eq"] >= c else R
         print(f"  Final Equity        : {col}{usd(st['final_eq'])}{W}")
-        print(f"  Total Return        : {(G if st['ret_pct']>=0 else R)}{pct(st['ret_pct'])}{W}")
+        col = G if st["ret_pct"] >= 0 else R
+        print(f"  Total Return        : {col}{pct(st['ret_pct'])}{W}")
         print(f"  Max Drawdown        : {R}{st['max_dd']:>8.2f}%{W}")
         print(f"  Fee Drag            : {Y}{usd(st['fee_drag'])}{W}")
 
@@ -374,25 +397,26 @@ def print_report(stats, settings, trades):
     print(f"  Trades × fee        : {stats['total']} × {fee}% = {stats['total']*fee:.2f}%")
     sep()
 
-    # trade log (last 20)
+    # ── trade log (last 20) ──────────────────────────────────
     print(f"\n  Last 20 Trades:")
-    print(f"  {'#':>4}  {'Date':<17}  {'Entry':>8}  {'SL':>8}  {'TP':>8}  "
-          f"{'Exit':>8}  {'Why':<9}  {'Gross':>7}  {'Net':>7}  {'Result'}")
-    print(f"  {'─'*100}")
-    for i, t in enumerate(trades[-20:], start=max(1, len(trades)-19)):
-        res = f"{G}WIN{W}" if t["win"] else f"{R}LOSS{W}"
+    hdr = (f"  {'#':>4}  {'Date':<17}  {'Entry':>8}  {'SL':>8}  "
+           f"{'TP':>8}  {'Exit':>8}  {'Why':<4}  {'Gross':>7}  {'Net':>7}  Result")
+    print(hdr)
+    print(f"  {'─'*len(hdr)}")
+    for i, t in enumerate(trades[-20:], start=max(1, len(trades) - 19)):
+        res = f"{G}WIN {W}" if t["win"] else f"{R}LOSS{W}"
         gc  = G if t["gross_pct"] >= 0 else R
         nc  = G if t["net_pct"]   >= 0 else R
         print(f"  {i:>4}  {t['date']:<17}  {t['entry']:>8.3f}  {t['sl']:>8.3f}  "
-              f"{t['tp']:>8.3f}  {t['exit']:>8.3f}  {t['reason']:<9}  "
+              f"{t['tp']:>8.3f}  {t['exit']:>8.3f}  {t['reason']:<4}  "
               f"{gc}{t['gross_pct']:>+6.2f}%{W}  {nc}{t['net_pct']:>+6.2f}%{W}  {res}")
 
 
 # ─────────────────────────────────────────────────────────────
 #  SAVE CSV
 # ─────────────────────────────────────────────────────────────
-def save_csv(trades, stats, settings):
-    df = pd.DataFrame(trades)
+def save_csv(trades, settings):
+    df    = pd.DataFrame(trades)
     fname = f"backtest_{settings['symbol']}_{settings['timeframe']}.csv"
     df.to_csv(fname, index=False)
     print(f"\n💾  Trade log saved → {fname}")
@@ -413,11 +437,12 @@ def main():
     print(f"  TP         : {s['tp_mult']}× SL  ({s['tp_mult']*s['sl_mult']}× ATR)")
     print(f"  Capital    : ${s['capital']:,}")
     print(f"  Fee        : {s['fee_pct']}% round trip")
+    print(f"  Min sell   : {s['min_sell_bricks']} consecutive bearish bricks")
 
     df      = fetch_all_klines(s["symbol"], s["timeframe"], s["years"])
     atr_arr = calc_atr(df, s["atr_period"])
 
-    print(f"🧱  Building Renko bricks (mult={s['renko_mult']}×ATR)…")
+    print(f"\n🧱  Building Renko bricks (mult={s['renko_mult']}×ATR)…")
     bricks  = build_renko(df, atr_arr, s["renko_mult"])
     print(f"    {len(bricks):,} bricks built")
 
@@ -425,13 +450,13 @@ def main():
     trades  = run_strategy(bricks, df, s)
     print(f"    {len(trades):,} trades found")
 
-    stats   = calc_stats(trades, s["capital"], s["fee_pct"])
+    stats = calc_stats(trades, s["capital"], s["fee_pct"])
     if stats is None:
         print("❌  No trades generated. Try adjusting settings.")
         return
 
     print_report(stats, s, trades)
-    save_csv(trades, stats, s)
+    save_csv(trades, s)
 
 
 if __name__ == "__main__":
