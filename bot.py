@@ -20,7 +20,7 @@ SETTINGS = {
     "timeframe"       : "5m",          # 1m 3m 5m 15m 30m 1h 4h 1d
     "years"           : 5,            # how many years of data
     "atr_period"      : 14,
-    "renko_mult"      : 1.0,           # brick size = renko_mult × ATR
+    "renko_mult"      : 1.5,           # brick size = renko_mult × ATR
     "sl_mult"         : 1.5,           # SL = sl_mult × ATR below entry
     "tp_mult"         : 3.0,           # TP = tp_mult × SL above entry
     "capital"         : 1000,          # starting capital in USD
