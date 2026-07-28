@@ -17,7 +17,7 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────
 SETTINGS = {
     "symbol"          : "SOLUSDT",
-    "timeframe"       : "5m",          # 1m 3m 5m 15m 30m 1h 4h 1d
+    "timeframe"       : "15m",          # 1m 3m 5m 15m 30m 1h 4h 1d
     "years"           : 15,            # how many years of data
     "atr_period"      : 14,
     "renko_mult"      : 1.0,           # brick size = renko_mult × ATR
