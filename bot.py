@@ -38,7 +38,7 @@ SETTINGS = {
     "sl_mult"         : 1.5,            # SL = sl_mult × ATR below entry
     "tp_mult"         : 3.0,            # TP = tp_mult × SL above entry
     "min_sell_bricks" : 2,              # min consecutive bearish bricks before entry
-    "lookback_candles": 400,            # candles to fetch for ATR + Renko context
+    "lookback_candles": 200,            # candles to fetch for ATR + Renko context
     "heartbeat_mins"  : 60,             # send "still alive" ping every N minutes
 }
 
@@ -175,10 +175,19 @@ def build_renko(closes, atr_arr, mult: float):
 #  can detect when new bricks appear.
 # ─────────────────────────────────────────────────────────────
 def detect_signal(bricks, min_sell_bricks: int, sl_mult: float,
-                  tp_mult: float, last_brick_count: int):
+                  tp_mult: float, last_brick_count: int,
+                  last_entry_price: float = 0.0,
+                  atr_gap_mult: float = 1.0):
     """
     Walk from where we last left off.
     Return (signal_dict | None, new_last_brick_count).
+
+    FIX - duplicate entry guard:
+    Bricks are rebuilt fresh each poll, so the same historical
+    bullish brick can re-trigger after a SL/TP reset if last_n
+    shifts slightly. We block any new signal whose entry is within
+    (atr_gap_mult x ATR) of the previous entry price. A genuine
+    new signal will be at least 1 ATR away from the last entry.
     """
     n = len(bricks)
     if n == last_brick_count or n < 3:
@@ -192,11 +201,17 @@ def detect_signal(bricks, min_sell_bricks: int, sl_mult: float,
         if b["dir"] == -1:
             sell_run += 1
         else:
-            # bullish brick
+            # bullish brick - only consider NEW bricks (beyond last cursor)
             if sell_run >= min_sell_bricks and i >= last_brick_count:
-                # this is a NEW bullish brick that appeared after our last check
                 entry = b["close"]
                 atr   = b["atr"]
+                # duplicate guard: skip if entry is within atr_gap_mult x ATR
+                # of the last entry - it is the same signal replaying
+                if last_entry_price > 0:
+                    gap = abs(entry - last_entry_price)
+                    if gap < atr_gap_mult * atr:
+                        sell_run = 0
+                        continue
                 sl    = entry - sl_mult * atr
                 tp    = entry + tp_mult * sl_mult * atr
                 signal = {
@@ -234,11 +249,12 @@ class RenkoWorker:
         self.symbol    = symbol
         self.tf        = timeframe
         self.s         = settings
-        self.trade     = None          # current open trade or None
-        self.last_n    = 0             # last known brick count
-        self.last_beat = time.time()   # last heartbeat timestamp
-        self.total_trades = 0
-        self.wins         = 0
+        self.trade            = None   # current open trade or None
+        self.last_n           = 0      # last known brick count
+        self.last_entry_price = 0.0    # price of last entry (duplicate guard)
+        self.last_beat        = time.time()
+        self.total_trades     = 0
+        self.wins             = 0
 
         tag = f"[{symbol} {timeframe}]"
         send_tg(
@@ -335,11 +351,14 @@ class RenkoWorker:
             self.s["sl_mult"],
             self.s["tp_mult"],
             self.last_n,
+            last_entry_price = self.last_entry_price,
+            atr_gap_mult     = 1.0,
         )
         self.last_n = new_n
 
         if signal:
-            self.trade = signal
+            self.trade            = signal
+            self.last_entry_price = signal["entry"]
             rr = self.s["tp_mult"] * self.s["sl_mult"]
             send_tg(
                 f"🟢 <b>BUY SIGNAL</b> — {self.symbol} {self.tf}\n"
