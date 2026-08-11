@@ -43,7 +43,7 @@ CONFIG = {
     "atr_period"      : 14,
     "renko_mult"      : 1.0,      # brick size = renko_mult x ATR
     "sl_mult"         : 1.5,      # SL = sl_mult x ATR below entry
-    "tp_mult"         : 2,        # TP = tp_mult x SL above entry
+    "tp_mult"         : 2.5,        # TP = tp_mult x SL above entry
     "min_sell_bricks" : 2,        # min consecutive bearish bricks before entry
     "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
 
@@ -60,7 +60,7 @@ CONFIG = {
     # as a "TP win" in the stats.
     "enable_trailing_sl" : True,
     "trail_trigger_mult" : 2.0,   # activate trail once price is +2x SL-distance in profit
-    "trail_lock_mult"    : .1,    # trailed SL locks in +0.1x SL-distance profit
+    "trail_lock_mult"    : 1.2,    # trailed SL locks in +0.1x SL-distance profit
 
     "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
     "risk_pct_per_trade": 100.0,  # % of capital "risked" per trade for equity curve (100 = full compounding)
