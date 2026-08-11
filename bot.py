@@ -43,9 +43,18 @@ CONFIG = {
     "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
 
     # execution assumptions (set to 0 to test the "perfect fill" case)
-    "fee_pct"         : 0.02,     # taker fee per side, % (Binance spot default ~0.1%, many use 0.04% w/ BNB)
+    "fee_pct"         : 0.04,     # taker fee per side, % (Binance spot default ~0.1%, many use 0.04% w/ BNB)
     "slippage_pct"    : 0.02,     # extra slippage per side, %
-    "exit_priority"   : "SL",     # if a single candle's range touches BOTH tp & sl: "SL" (conservative) or "TP"
+    "exit_priority"   : "SL",     # if a single candle's range touches BOTH tp & sl (or sl & trigger): "SL" (conservative) or "TP"
+
+    # ── trailing stop-loss ──────────────────────────────────────
+    # Once price reaches  entry + trail_trigger_mult x (sl distance),
+    # the SL is moved up (once) to  entry + trail_lock_mult x (sl distance).
+    # A trade that later reverses and hits this trailing stop is logged
+    # as its own outcome ("TRAIL_SL") — separate from a normal TP win.
+    "enable_trailing_sl" : True,
+    "trail_trigger_mult" : 2.0,   # activate trail once price is +2x SL-distance in profit
+    "trail_lock_mult"    : 0.8,   # trailed SL locks in +0.8x SL-distance profit
 
     "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
     "risk_pct_per_trade": 100.0,  # % of capital "risked" per trade for equity curve (100 = full compounding)
@@ -231,23 +240,56 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
 
         # ── we're in a trade: scan forward candle-by-candle for exit ──
         t = open_trade
-        exit_found = False
+        sl_dist = t["entry"] - t["sl"]           # original SL distance, in price
+        trail_trigger_px = t["entry"] + cfg["trail_trigger_mult"] * sl_dist
+        trail_sl_px      = t["entry"] + cfg["trail_lock_mult"]    * sl_dist
+
+        current_sl   = t["sl"]
+        trailed      = False
+        exit_found   = False
+
         for j in range(t["entry_idx"] + 1, len(closes)):
             hit_tp = highs[j] >= t["tp"]
-            hit_sl = lows[j]  <= t["sl"]
 
-            if hit_tp and hit_sl:
-                outcome = cfg["exit_priority"]   # ambiguous same-candle case
-            elif hit_tp:
-                outcome = "TP"
-            elif hit_sl:
-                outcome = "SL"
+            if not trailed:
+                hit_orig_sl  = lows[j]  <= current_sl
+                hit_trigger  = cfg["enable_trailing_sl"] and highs[j] >= trail_trigger_px
+
+                if hit_tp and hit_orig_sl:
+                    # same candle touches both original SL and TP — ambiguous
+                    outcome = cfg["exit_priority"]
+                    exit_price = t["tp"] if outcome == "TP" else current_sl
+                elif hit_tp:
+                    outcome, exit_price = "TP", t["tp"]
+                elif hit_orig_sl and not hit_trigger:
+                    outcome, exit_price = "SL", current_sl
+                elif hit_trigger:
+                    # trail activates this candle
+                    trailed    = True
+                    current_sl = trail_sl_px
+                    # same candle may also dip back through the new trailed SL
+                    if lows[j] <= current_sl:
+                        outcome, exit_price = "TRAIL_SL", current_sl
+                    else:
+                        continue   # trade stays open, now trailing
+                else:
+                    continue
             else:
-                continue
+                hit_trail_sl = lows[j] <= current_sl
+                if hit_tp and hit_trail_sl:
+                    if cfg["exit_priority"] == "SL":
+                        outcome, exit_price = "TRAIL_SL", current_sl
+                    else:
+                        outcome, exit_price = "TP", t["tp"]
+                elif hit_tp:
+                    outcome, exit_price = "TP", t["tp"]
+                elif hit_trail_sl:
+                    outcome, exit_price = "TRAIL_SL", current_sl
+                else:
+                    continue
 
-            exit_price = t["tp"] if outcome == "TP" else t["sl"]
-            gross_pct  = (exit_price - t["entry"]) / t["entry"]
-            net_pct    = gross_pct - 2 * fee_slip   # entry + exit friction
+            gross_pct = (exit_price - t["entry"]) / t["entry"]
+            net_pct   = gross_pct - 2 * fee_slip   # entry + exit friction
 
             trades.append({
                 "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
@@ -255,6 +297,7 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
                 "entry"     : t["entry"],
                 "sl"        : t["sl"],
                 "tp"        : t["tp"],
+                "trail_sl"  : trail_sl_px if cfg["enable_trailing_sl"] else None,
                 "atr"       : t["atr"],
                 "outcome"   : outcome,
                 "gross_pct" : gross_pct * 100,
@@ -275,6 +318,7 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
                 "entry"     : t["entry"],
                 "sl"        : t["sl"],
                 "tp"        : t["tp"],
+                "trail_sl"  : trail_sl_px if cfg["enable_trailing_sl"] else None,
                 "atr"       : t["atr"],
                 "outcome"   : "OPEN_AT_END",
                 "gross_pct" : (closes[-1] - t["entry"]) / t["entry"] * 100,
@@ -304,14 +348,21 @@ def summarize(trades: list, cfg: dict):
     n_closed = len(closed)
     n_tp     = (closed["outcome"] == "TP").sum()
     n_sl     = (closed["outcome"] == "SL").sum()
-    win_rate = n_tp / n_closed * 100 if n_closed else 0.0
+    n_trail  = (closed["outcome"] == "TRAIL_SL").sum()
+
+    # "win rate" = clean TP hits only, per your request that trailing
+    # exits are NOT counted as a normal win. trail_rate is reported separately.
+    win_rate   = n_tp / n_closed * 100 if n_closed else 0.0
+    trail_rate = n_trail / n_closed * 100 if n_closed else 0.0
+    loss_rate  = n_sl / n_closed * 100 if n_closed else 0.0
 
     gains = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
     losses = -closed.loc[closed["net_pct"] < 0, "net_pct"].sum()
     profit_factor = gains / losses if losses > 0 else float("inf")
 
-    avg_win  = closed.loc[closed["net_pct"] > 0, "net_pct"].mean() if n_tp else 0
-    avg_loss = closed.loc[closed["net_pct"] < 0, "net_pct"].mean() if n_sl else 0
+    avg_win   = closed.loc[closed["outcome"] == "TP",       "net_pct"].mean() if n_tp else 0
+    avg_trail = closed.loc[closed["outcome"] == "TRAIL_SL", "net_pct"].mean() if n_trail else 0
+    avg_loss  = closed.loc[closed["outcome"] == "SL",       "net_pct"].mean() if n_sl else 0
     expectancy = closed["net_pct"].mean() if n_closed else 0
 
     # equity curve (compounding, risk_pct_per_trade of capital per trade)
@@ -338,9 +389,11 @@ def summarize(trades: list, cfg: dict):
           f"TP={cfg['tp_mult']}xSL | min_sell={cfg['min_sell_bricks']}")
     print(f"  Total signals : {n_total}  ({n_closed} closed, "
           f"{n_total - n_closed} still open at data end)")
-    print(f"  Wins / Losses : {n_tp} / {n_sl}")
-    print(f"  Win rate      : {win_rate:.1f}%")
-    print(f"  Avg win       : {avg_win:+.2f}%")
+    print(f"  TP wins       : {n_tp}   ({win_rate:.1f}%)")
+    print(f"  Trailing-SL   : {n_trail}   ({trail_rate:.1f}%)  <- NOT counted as a TP win")
+    print(f"  Losses (SL)   : {n_sl}   ({loss_rate:.1f}%)")
+    print(f"  Avg TP win    : {avg_win:+.2f}%")
+    print(f"  Avg trail win : {avg_trail:+.2f}%")
     print(f"  Avg loss      : {avg_loss:+.2f}%")
     print(f"  Expectancy/tr : {expectancy:+.3f}%")
     print(f"  Profit factor : {profit_factor:.2f}")
