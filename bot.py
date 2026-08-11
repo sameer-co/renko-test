@@ -13,19 +13,24 @@ What it does:
   4. Determines the exit (TP/SL) using intrabar HIGH/LOW of the
      candles that follow the entry — not just candle closes — so
      the backtest reflects what would really have happened.
-  5. Prints a performance summary and saves a trade-by-trade CSV
-     + an equity curve chart.
+  5. Runs the backtest TWICE on the same signals/bricks — once with
+     the trailing-SL feature OFF and once with it ON — and prints
+     both summaries side by side so you can see exactly what the
+     trailing stop is doing to your numbers.
+  6. Prints a performance summary and saves an equity curve chart
+     (no trade-by-trade CSV is written).
 
 Every strategy parameter lives in CONFIG below — nothing else needs
 to be touched to test a different symbol, timeframe, ATR period,
 brick size, SL/TP multiples, or lookback window.
 """
 
-import requests
+import copy
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+import requests
+from datetime import datetime, timezone
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG — everything you'd want to change lives here
@@ -38,7 +43,7 @@ CONFIG = {
     "atr_period"      : 14,
     "renko_mult"      : 1.0,      # brick size = renko_mult x ATR
     "sl_mult"         : 1.5,      # SL = sl_mult x ATR below entry
-    "tp_mult"         : 2,      # TP = tp_mult x SL above entry
+    "tp_mult"         : 2,        # TP = tp_mult x SL above entry
     "min_sell_bricks" : 2,        # min consecutive bearish bricks before entry
     "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
 
@@ -51,10 +56,11 @@ CONFIG = {
     # Once price reaches  entry + trail_trigger_mult x (sl distance),
     # the SL is moved up (once) to  entry + trail_lock_mult x (sl distance).
     # A trade that later reverses and hits this trailing stop is logged
-    # as its own outcome ("TRAIL_SL") — separate from a normal TP win.
+    # as its own outcome ("TRAIL_SL") — a locked-in gain, but NOT counted
+    # as a "TP win" in the stats.
     "enable_trailing_sl" : True,
     "trail_trigger_mult" : 2.0,   # activate trail once price is +2x SL-distance in profit
-    "trail_lock_mult"    : .1,   # trailed SL locks in +0.8x SL-distance profit
+    "trail_lock_mult"    : .1,    # trailed SL locks in +0.1x SL-distance profit
 
     "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
     "risk_pct_per_trade": 100.0,  # % of capital "risked" per trade for equity curve (100 = full compounding)
@@ -334,10 +340,12 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
 
 # ─────────────────────────────────────────────────────────────
 #  PERFORMANCE SUMMARY
+#  Returns a dict of computed stats (used both for printing and
+#  for the with/without-trailing comparison table) — no CSV output.
 # ─────────────────────────────────────────────────────────────
-def summarize(trades: list, cfg: dict):
+def summarize(trades: list, cfg: dict, label: str = ""):
     if not trades:
-        print("\nNo trades were generated over this period — "
+        print(f"\nNo trades were generated over this period ({label}) — "
               "try loosening min_sell_bricks or the lookback window.")
         return None
 
@@ -350,13 +358,13 @@ def summarize(trades: list, cfg: dict):
     n_sl     = (closed["outcome"] == "SL").sum()
     n_trail  = (closed["outcome"] == "TRAIL_SL").sum()
 
-    # "win rate" = clean TP hits only, per your request that trailing
-    # exits are NOT counted as a normal win. trail_rate is reported separately.
+    # "win rate" = clean TP hits only — trailing exits are a separate,
+    # positive-but-not-full-TP outcome, reported on their own line.
     win_rate   = n_tp / n_closed * 100 if n_closed else 0.0
     trail_rate = n_trail / n_closed * 100 if n_closed else 0.0
     loss_rate  = n_sl / n_closed * 100 if n_closed else 0.0
 
-    gains = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
+    gains  = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
     losses = -closed.loc[closed["net_pct"] < 0, "net_pct"].sum()
     profit_factor = gains / losses if losses > 0 else float("inf")
 
@@ -380,13 +388,25 @@ def summarize(trades: list, cfg: dict):
 
     total_return_pct = (curve[-1] / curve[0] - 1) * 100
 
+    stats = {
+        "label": label, "df": df, "curve": curve, "max_dd": max_dd,
+        "total_return_pct": total_return_pct, "n_total": n_total,
+        "n_closed": n_closed, "n_tp": n_tp, "n_sl": n_sl, "n_trail": n_trail,
+        "win_rate": win_rate, "trail_rate": trail_rate, "loss_rate": loss_rate,
+        "avg_win": avg_win, "avg_trail": avg_trail, "avg_loss": avg_loss,
+        "expectancy": expectancy, "profit_factor": profit_factor,
+        "avg_bars_held": closed["bars_held"].mean(),
+        "final_equity": curve[-1],
+    }
+
     print("\n" + "═" * 60)
     print(f"  BACKTEST SUMMARY — {cfg['symbol']} {cfg['timeframe']} "
-          f"({cfg['lookback_days']}d)")
+          f"({cfg['lookback_days']}d)  [{label}]")
     print("═" * 60)
     print(f"  Params        : ATR({cfg['atr_period']}) | "
           f"brick={cfg['renko_mult']}xATR | SL={cfg['sl_mult']}xATR | "
-          f"TP={cfg['tp_mult']}xSL | min_sell={cfg['min_sell_bricks']}")
+          f"TP={cfg['tp_mult']}xSL | min_sell={cfg['min_sell_bricks']} | "
+          f"trailing={'ON' if cfg['enable_trailing_sl'] else 'OFF'}")
     print(f"  Total signals : {n_total}  ({n_closed} closed, "
           f"{n_total - n_closed} still open at data end)")
     print(f"  TP wins       : {n_tp}   ({win_rate:.1f}%)")
@@ -400,11 +420,51 @@ def summarize(trades: list, cfg: dict):
     print(f"  Total return  : {total_return_pct:+.1f}%  "
           f"(${cfg['initial_capital']:.0f} → ${curve[-1]:.0f})")
     print(f"  Max drawdown  : {max_dd:.1f}%")
-    print(f"  Avg bars held : {closed['bars_held'].mean():.1f}")
+    print(f"  Avg bars held : {stats['avg_bars_held']:.1f}")
     print("═" * 60)
 
-    return {"df": df, "curve": curve, "max_dd": max_dd,
-            "total_return_pct": total_return_pct}
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────
+#  WITHOUT vs WITH TRAILING — side-by-side comparison table
+# ─────────────────────────────────────────────────────────────
+def print_comparison(no_trail: dict, with_trail: dict):
+    if no_trail is None or with_trail is None:
+        return
+
+    rows = [
+        ("Total signals",  f"{no_trail['n_total']}",              f"{with_trail['n_total']}"),
+        ("Closed trades",  f"{no_trail['n_closed']}",              f"{with_trail['n_closed']}"),
+        ("TP wins",        f"{no_trail['n_tp']} ({no_trail['win_rate']:.1f}%)",
+                            f"{with_trail['n_tp']} ({with_trail['win_rate']:.1f}%)"),
+        ("Trailing-SL",    f"{no_trail['n_trail']} ({no_trail['trail_rate']:.1f}%)",
+                            f"{with_trail['n_trail']} ({with_trail['trail_rate']:.1f}%)"),
+        ("Losses (SL)",    f"{no_trail['n_sl']} ({no_trail['loss_rate']:.1f}%)",
+                            f"{with_trail['n_sl']} ({with_trail['loss_rate']:.1f}%)"),
+        ("Avg TP win",     f"{no_trail['avg_win']:+.2f}%",         f"{with_trail['avg_win']:+.2f}%"),
+        ("Avg trail win",  f"{no_trail['avg_trail']:+.2f}%",       f"{with_trail['avg_trail']:+.2f}%"),
+        ("Avg loss",       f"{no_trail['avg_loss']:+.2f}%",        f"{with_trail['avg_loss']:+.2f}%"),
+        ("Expectancy/tr",  f"{no_trail['expectancy']:+.3f}%",      f"{with_trail['expectancy']:+.3f}%"),
+        ("Profit factor",  f"{no_trail['profit_factor']:.2f}",     f"{with_trail['profit_factor']:.2f}"),
+        ("Total return",   f"{no_trail['total_return_pct']:+.1f}%",f"{with_trail['total_return_pct']:+.1f}%"),
+        ("Final equity",   f"${no_trail['final_equity']:.0f}",     f"${with_trail['final_equity']:.0f}"),
+        ("Max drawdown",   f"{no_trail['max_dd']:.1f}%",           f"{with_trail['max_dd']:.1f}%"),
+        ("Avg bars held",  f"{no_trail['avg_bars_held']:.1f}",     f"{with_trail['avg_bars_held']:.1f}"),
+    ]
+
+    label_w = max(len(r[0]) for r in rows) + 2
+    col_w   = max(max(len(r[1]) for r in rows), len(no_trail['label'])) + 2
+    col_w   = max(col_w, max(len(r[2]) for r in rows), len(with_trail['label'])) + 2
+
+    print("\n" + "═" * (label_w + col_w * 2 + 2))
+    print("  WITHOUT TRAILING  vs  WITH TRAILING")
+    print("═" * (label_w + col_w * 2 + 2))
+    print(f"  {'Metric':<{label_w}}{no_trail['label']:<{col_w}}{with_trail['label']:<{col_w}}")
+    print("-" * (label_w + col_w * 2 + 2))
+    for name, a, b in rows:
+        print(f"  {name:<{label_w}}{a:<{col_w}}{b:<{col_w}}")
+    print("═" * (label_w + col_w * 2 + 2))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -420,36 +480,53 @@ def main(cfg=None):
     bricks  = build_renko(closes, atr_arr, cfg["renko_mult"])
     print(f"[RENKO] Built {len(bricks)} bricks from {len(closes)} candles")
 
-    trades = run_backtest(highs, lows, closes, times, bricks, cfg)
-    result = summarize(trades, cfg)
+    # Same signals/bricks, run once with trailing OFF and once with it ON
+    # (respecting whatever cfg["enable_trailing_sl"] is set to for the
+    # "with trailing" run's other trail params).
+    cfg_no_trail = copy.deepcopy(cfg)
+    cfg_no_trail["enable_trailing_sl"] = False
 
-    if result is not None:
-        out_csv = "/mnt/user-data/outputs/renko_backtest_trades.csv"
-        result["df"].to_csv(out_csv, index=False)
-        print(f"\nSaved trade log → {out_csv}")
+    cfg_with_trail = copy.deepcopy(cfg)
+    cfg_with_trail["enable_trailing_sl"] = True
 
+    trades_no_trail   = run_backtest(highs, lows, closes, times, bricks, cfg_no_trail)
+    trades_with_trail = run_backtest(highs, lows, closes, times, bricks, cfg_with_trail)
+
+    stats_no_trail   = summarize(trades_no_trail,   cfg_no_trail,   label="WITHOUT trailing")
+    stats_with_trail = summarize(trades_with_trail, cfg_with_trail, label="WITH trailing")
+
+    print_comparison(stats_no_trail, stats_with_trail)
+
+    # equity curve chart — both runs overlaid for direct comparison
+    if stats_no_trail is not None and stats_with_trail is not None:
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(result["curve"], color="#2563eb", linewidth=1.5)
+            ax.plot(stats_no_trail["curve"],   color="#94a3b8", linewidth=1.5, label="Without trailing")
+            ax.plot(stats_with_trail["curve"], color="#2563eb", linewidth=1.5, label="With trailing")
             ax.set_title(f"{cfg['symbol']} {cfg['timeframe']} Renko-ATR — "
                          f"Equity Curve ({cfg['lookback_days']}d)")
             ax.set_xlabel("Trade #")
             ax.set_ylabel("Equity ($)")
+            ax.legend()
             ax.grid(alpha=0.3)
             fig.tight_layout()
             out_png = "/mnt/user-data/outputs/renko_backtest_equity_curve.png"
             fig.savefig(out_png, dpi=150)
-            print(f"Saved equity curve → {out_png}")
+            print(f"\nSaved equity curve → {out_png}")
         except Exception as e:
             print(f"[WARN] Could not save equity curve chart: {e}")
 
-    return trades, result
+    return {
+        "trades_no_trail": trades_no_trail,
+        "trades_with_trail": trades_with_trail,
+        "stats_no_trail": stats_no_trail,
+        "stats_with_trail": stats_with_trail,
+    }
 
 
 if __name__ == "__main__":
     main()
-  
