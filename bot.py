@@ -1,115 +1,134 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      SOL Renko ATR Forward Tester — Binance Public API          ║
-║  Runs two loops in parallel: 3m and 5m timeframes               ║
-║  Sends Telegram alerts on ENTRY, TP, SL, and heartbeat         ║
+║      Renko ATR Strategy — 1-Year Backtester (Binance Public API) ║
+║  Same signal logic as the live forward tester, run over history  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-Strategy (same as backtest):
-  • Build ATR-based Renko bricks from live candles
-  • BUY when a bullish brick forms after ≥ min_sell_bricks bearish ones
-  • SL  = entry − sl_mult × ATR
-  • TP  = entry + tp_mult × sl_mult × ATR
-  • Alerts sent via Telegram for every key event
+What it does:
+  1. Downloads N days of historical candles from Binance (paginated).
+  2. Builds ATR + ATR-based Renko bricks (identical logic to your bot).
+  3. Walks the bricks, opens a trade on the same BUY signal condition
+     (bullish brick after >= min_sell_bricks bearish ones, with the
+     same duplicate-entry ATR-gap guard).
+  4. Determines the exit (TP/SL) using intrabar HIGH/LOW of the
+     candles that follow the entry — not just candle closes — so
+     the backtest reflects what would really have happened.
+  5. Prints a performance summary and saves a trade-by-trade CSV
+     + an equity curve chart.
+
+Every strategy parameter lives in CONFIG below — nothing else needs
+to be touched to test a different symbol, timeframe, ATR period,
+brick size, SL/TP multiples, or lookback window.
 """
 
 import requests
 import time
-import threading
 import numpy as np
-from datetime import datetime, timezone
-from collections import deque
+import pandas as pd
+from datetime import datetime, timezone, timedelta
 
 # ─────────────────────────────────────────────────────────────
-#  TELEGRAM CONFIG
+#  CONFIG — everything you'd want to change lives here
 # ─────────────────────────────────────────────────────────────
-TG_TOKEN   = "8661081060:AAGtNViZMS6FSl_7vQeMz1TcCnzrFddu7z4"
-TG_CHAT_ID = "1950462171"
-TG_URL     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
-# ─────────────────────────────────────────────────────────────
-#  STRATEGY SETTINGS
-# ─────────────────────────────────────────────────────────────
-SETTINGS = {
+CONFIG = {
     "symbol"          : "SOLUSDT",
-    "timeframes"      : ["3m", "5m"],   # both run in parallel
+    "timeframe"       : "5m",     # any Binance interval: 1m,3m,5m,15m,30m,1h,4h,1d ...
+    "lookback_days"   : 365,      # how far back to backtest
+
     "atr_period"      : 14,
-    "renko_mult"      : 1.0,            # brick size = renko_mult × ATR
-    "sl_mult"         : 1.5,            # SL = sl_mult × ATR below entry
-    "tp_mult"         : 3.0,            # TP = tp_mult × SL above entry
-    "min_sell_bricks" : 2,              # min consecutive bearish bricks before entry
-    "lookback_candles": 200,            # candles to fetch for ATR + Renko context
-    "heartbeat_mins"  : 60,             # send "still alive" ping every N minutes
+    "renko_mult"      : 1.0,      # brick size = renko_mult x ATR
+    "sl_mult"         : 1.5,      # SL = sl_mult x ATR below entry
+    "tp_mult"         : 3.0,      # TP = tp_mult x SL above entry
+    "min_sell_bricks" : 2,        # min consecutive bearish bricks before entry
+    "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
+
+    # execution assumptions (set to 0 to test the "perfect fill" case)
+    "fee_pct"         : 0.04,     # taker fee per side, % (Binance spot default ~0.1%, many use 0.04% w/ BNB)
+    "slippage_pct"    : 0.02,     # extra slippage per side, %
+    "exit_priority"   : "SL",     # if a single candle's range touches BOTH tp & sl: "SL" (conservative) or "TP"
+
+    "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
+    "risk_pct_per_trade": 100.0,  # % of capital "risked" per trade for equity curve (100 = full compounding)
 }
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
-PRICE_URL   = "https://api.binance.com/api/v3/ticker/price"
 
-# Interval in seconds between each poll per timeframe
-POLL_SECONDS = {
-    "3m": 3 * 60,   # poll every 3 minutes
-    "5m": 5 * 60,   # poll every 5 minutes
+INTERVAL_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+    "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+    "1d": 86_400_000,
 }
 
 
 # ─────────────────────────────────────────────────────────────
-#  TELEGRAM HELPERS
+#  HISTORICAL DATA — paginated fetch of `lookback_days`
 # ─────────────────────────────────────────────────────────────
-def send_tg(message: str, retries: int = 3):
-    """Send a Telegram message with retry logic."""
-    for attempt in range(retries):
-        try:
-            r = requests.post(TG_URL, json={
-                "chat_id"   : TG_CHAT_ID,
-                "text"      : message,
-                "parse_mode": "HTML",
-            }, timeout=10)
-            if r.status_code == 200:
-                return True
-            print(f"[TG] HTTP {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"[TG] Error (attempt {attempt+1}): {e}")
-        time.sleep(2)
-    return False
+def fetch_historical_klines(symbol: str, interval: str, lookback_days: int):
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Unsupported interval '{interval}'. "
+                          f"Choose from: {list(INTERVAL_MS)}")
 
+    step_ms = INTERVAL_MS[interval]
+    end_ms  = int(time.time() * 1000)
+    start_ms = end_ms - lookback_days * 86_400_000
 
-def fmt_price(p: float) -> str:
-    return f"{p:.4f}"
+    all_rows = []
+    cursor = start_ms
+    print(f"[FETCH] {symbol} {interval} — downloading {lookback_days} days...")
 
+    while cursor < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor,
+            "limit": 1000,
+        }
+        r = requests.get(BINANCE_URL, params=params, timeout=15)
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            break
 
-def now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        all_rows.extend(rows)
+        last_open_time = rows[-1][0]
+        cursor = last_open_time + step_ms
 
+        # be polite to the API
+        time.sleep(0.25)
 
-# ─────────────────────────────────────────────────────────────
-#  DATA FETCH — last N closed candles
-# ─────────────────────────────────────────────────────────────
-def fetch_candles(symbol: str, interval: str, limit: int = 200):
-    """
-    Fetch the last `limit` CLOSED candles.
-    Binance returns the in-progress candle last, so we drop it.
-    """
-    params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
-    r = requests.get(BINANCE_URL, params=params, timeout=10)
-    r.raise_for_status()
-    raw = r.json()[:-1]   # drop the open/live candle
+        if len(rows) < 1000:
+            break
 
-    opens  = np.array([float(c[1]) for c in raw])
-    highs  = np.array([float(c[2]) for c in raw])
-    lows   = np.array([float(c[3]) for c in raw])
-    closes = np.array([float(c[4]) for c in raw])
-    times  = np.array([int(c[0])   for c in raw])
+    if not all_rows:
+        raise RuntimeError("No candles returned — check symbol/interval.")
+
+    # drop the last candle if it's still open (in-progress)
+    if all_rows[-1][6] > end_ms:   # closeTime > now => not closed yet
+        all_rows = all_rows[:-1]
+
+    # de-dupe by open time, keep order
+    seen = set()
+    dedup = []
+    for row in all_rows:
+        if row[0] not in seen:
+            seen.add(row[0])
+            dedup.append(row)
+
+    opens  = np.array([float(c[1]) for c in dedup])
+    highs  = np.array([float(c[2]) for c in dedup])
+    lows   = np.array([float(c[3]) for c in dedup])
+    closes = np.array([float(c[4]) for c in dedup])
+    times  = np.array([int(c[0])   for c in dedup])
+
+    print(f"[FETCH] Got {len(dedup)} candles "
+          f"({datetime.fromtimestamp(times[0]/1000, tz=timezone.utc):%Y-%m-%d} "
+          f"→ {datetime.fromtimestamp(times[-1]/1000, tz=timezone.utc):%Y-%m-%d})")
     return opens, highs, lows, closes, times
 
 
-def fetch_current_price(symbol: str) -> float:
-    r = requests.get(PRICE_URL, params={"symbol": symbol}, timeout=10)
-    r.raise_for_status()
-    return float(r.json()["price"])
-
-
 # ─────────────────────────────────────────────────────────────
-#  ATR (Wilder smoothing) — same as backtest
+#  ATR (Wilder smoothing) — identical to the live bot
 # ─────────────────────────────────────────────────────────────
 def calc_atr(highs, lows, closes, period: int) -> np.ndarray:
     n   = len(closes)
@@ -131,7 +150,7 @@ def calc_atr(highs, lows, closes, period: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────
-#  RENKO BUILDER — same logic as backtest
+#  RENKO BUILDER — identical to the live bot, keeps candle idx
 # ─────────────────────────────────────────────────────────────
 def build_renko(closes, atr_arr, mult: float):
     bricks  = []
@@ -168,296 +187,216 @@ def build_renko(closes, atr_arr, mult: float):
 
 
 # ─────────────────────────────────────────────────────────────
-#  SIGNAL DETECTION
-#  Returns the signal dict if a new trade signal is found,
-#  otherwise None.
-#  State carries: last known brick list (as snapshot) so we
-#  can detect when new bricks appear.
+#  BACKTEST ENGINE
+#  Walks bricks in time order. Same signal condition + duplicate
+#  guard as the live bot. Once a trade is open, no new signals are
+#  considered until it exits (matches the live bot's behaviour of
+#  only tracking one open trade at a time).
 # ─────────────────────────────────────────────────────────────
-def detect_signal(bricks, min_sell_bricks: int, sl_mult: float,
-                  tp_mult: float, last_brick_count: int,
-                  last_entry_price: float = 0.0,
-                  atr_gap_mult: float = 1.0):
-    """
-    Walk from where we last left off.
-    Return (signal_dict | None, new_last_brick_count).
-
-    FIX - duplicate entry guard:
-    Bricks are rebuilt fresh each poll, so the same historical
-    bullish brick can re-trigger after a SL/TP reset if last_n
-    shifts slightly. We block any new signal whose entry is within
-    (atr_gap_mult x ATR) of the previous entry price. A genuine
-    new signal will be at least 1 ATR away from the last entry.
-    """
-    n = len(bricks)
-    if n == last_brick_count or n < 3:
-        return None, n
-
+def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
+    trades = []
     sell_run = 0
-    signal   = None
+    open_trade = None
+    last_entry_price = 0.0
+    fee_slip = (cfg["fee_pct"] + cfg["slippage_pct"]) / 100.0  # per side
 
-    for i in range(n):
+    i = 0
+    while i < len(bricks):
         b = bricks[i]
-        if b["dir"] == -1:
-            sell_run += 1
-        else:
-            # bullish brick - only consider NEW bricks (beyond last cursor)
-            if sell_run >= min_sell_bricks and i >= last_brick_count:
-                entry = b["close"]
-                atr   = b["atr"]
-                # duplicate guard: skip if entry is within atr_gap_mult x ATR
-                # of the last entry - it is the same signal replaying
-                if last_entry_price > 0:
-                    gap = abs(entry - last_entry_price)
-                    if gap < atr_gap_mult * atr:
-                        sell_run = 0
-                        continue
-                sl    = entry - sl_mult * atr
-                tp    = entry + tp_mult * sl_mult * atr
-                signal = {
-                    "entry"    : entry,
-                    "sl"       : sl,
-                    "tp"       : tp,
-                    "atr"      : atr,
-                    "sell_run" : sell_run,
-                }
-            sell_run = 0
 
-    return signal, n
-
-
-# ─────────────────────────────────────────────────────────────
-#  TRADE MONITOR — checks open trade against live price
-# ─────────────────────────────────────────────────────────────
-def check_trade(trade: dict, symbol: str) -> tuple:
-    """
-    Returns ("TP" | "SL" | "OPEN", current_price)
-    """
-    price = fetch_current_price(symbol)
-    if price >= trade["tp"]:
-        return "TP", price
-    if price <= trade["sl"]:
-        return "SL", price
-    return "OPEN", price
-
-
-# ─────────────────────────────────────────────────────────────
-#  PER-TIMEFRAME WORKER
-# ─────────────────────────────────────────────────────────────
-class RenkoWorker:
-    def __init__(self, symbol: str, timeframe: str, settings: dict):
-        self.symbol    = symbol
-        self.tf        = timeframe
-        self.s         = settings
-        self.trade            = None   # current open trade or None
-        self.last_n           = 0      # last known brick count
-        self.last_entry_price = 0.0    # price of last entry (duplicate guard)
-        self.last_beat        = time.time()
-        self.total_trades     = 0
-        self.wins             = 0
-
-        tag = f"[{symbol} {timeframe}]"
-        send_tg(
-            f"🚀 <b>Forward Tester Started</b>\n"
-            f"Pair: <code>{symbol}</code> | TF: <code>{timeframe}</code>\n"
-            f"ATR period: {settings['atr_period']} | "
-            f"Brick: {settings['renko_mult']}×ATR\n"
-            f"SL: {settings['sl_mult']}×ATR | "
-            f"TP: {settings['tp_mult']}×SL\n"
-            f"Min sell bricks: {settings['min_sell_bricks']}\n"
-            f"Time: {now_utc()}"
-        )
-        print(f"{tag} Worker initialised")
-
-    # ── main loop ───────────────────────────────────────────
-    def run(self):
-        poll = POLL_SECONDS.get(self.tf, 180)
-        tag  = f"[{self.symbol} {self.tf}]"
-
-        while True:
-            try:
-                self._tick()
-            except Exception as e:
-                msg = f"⚠️ {tag} Error: {e}"
-                print(msg)
-                send_tg(msg)
-
-            # heartbeat
-            if time.time() - self.last_beat >= self.s["heartbeat_mins"] * 60:
-                self._heartbeat()
-                self.last_beat = time.time()
-
-            time.sleep(poll)
-
-    # ── one poll cycle ───────────────────────────────────────
-    def _tick(self):
-        tag  = f"[{self.symbol} {self.tf}]"
-        _, highs, lows, closes, _ = fetch_candles(
-            self.symbol, self.tf, self.s["lookback_candles"])
-        atr_arr = calc_atr(highs, lows, closes, self.s["atr_period"])
-        bricks  = build_renko(closes, atr_arr, self.s["renko_mult"])
-
-        # ── if in a trade, check for exit ───────────────────
-        if self.trade is not None:
-            status, price = check_trade(self.trade, self.symbol)
-            t = self.trade
-
-            if status == "TP":
-                pct = (t["tp"] - t["entry"]) / t["entry"] * 100
-                self.wins += 1
-                self.total_trades += 1
-                send_tg(
-                    f"✅ <b>TAKE PROFIT HIT</b> — {self.symbol} {self.tf}\n"
-                    f"Entry : <code>{fmt_price(t['entry'])}</code>\n"
-                    f"TP    : <code>{fmt_price(t['tp'])}</code>\n"
-                    f"Price : <code>{fmt_price(price)}</code>\n"
-                    f"P&L   : <b>+{pct:.2f}%</b>\n"
-                    f"Win rate: {self.wins}/{self.total_trades} "
-                    f"({100*self.wins/self.total_trades:.1f}%)\n"
-                    f"⏰ {now_utc()}"
-                )
-                print(f"{tag} ✅ TP hit at {price:.4f}  (+{pct:.2f}%)")
-                self.trade = None
-                self.last_n = len(bricks)   # reset brick cursor
-
-            elif status == "SL":
-                pct = (t["sl"] - t["entry"]) / t["entry"] * 100
-                self.total_trades += 1
-                send_tg(
-                    f"❌ <b>STOP LOSS HIT</b> — {self.symbol} {self.tf}\n"
-                    f"Entry : <code>{fmt_price(t['entry'])}</code>\n"
-                    f"SL    : <code>{fmt_price(t['sl'])}</code>\n"
-                    f"Price : <code>{fmt_price(price)}</code>\n"
-                    f"P&L   : <b>{pct:.2f}%</b>\n"
-                    f"Win rate: {self.wins}/{self.total_trades} "
-                    f"({100*self.wins/self.total_trades:.1f}%)\n"
-                    f"⏰ {now_utc()}"
-                )
-                print(f"{tag} ❌ SL hit at {price:.4f}  ({pct:.2f}%)")
-                self.trade = None
-                self.last_n = len(bricks)
-
+        if open_trade is None:
+            if b["dir"] == -1:
+                sell_run += 1
             else:
-                # trade still open — log to console only
-                pct = (price - t["entry"]) / t["entry"] * 100
-                print(f"{tag} 📊 Open trade | Price: {price:.4f} | "
-                      f"Entry: {t['entry']:.4f} | P&L: {pct:+.2f}%")
-            return
+                if sell_run >= cfg["min_sell_bricks"]:
+                    entry     = b["close"]
+                    atr       = b["atr"]
+                    entry_idx = b["idx"]
 
-        # ── not in a trade — scan for new signal ────────────
-        signal, new_n = detect_signal(
-            bricks,
-            self.s["min_sell_bricks"],
-            self.s["sl_mult"],
-            self.s["tp_mult"],
-            self.last_n,
-            last_entry_price = self.last_entry_price,
-            atr_gap_mult     = 1.0,
-        )
-        self.last_n = new_n
+                    dup = (last_entry_price > 0 and
+                           abs(entry - last_entry_price) < cfg["atr_gap_mult"] * atr)
 
-        if signal:
-            self.trade            = signal
-            self.last_entry_price = signal["entry"]
-            rr = self.s["tp_mult"] * self.s["sl_mult"]
-            send_tg(
-                f"🟢 <b>BUY SIGNAL</b> — {self.symbol} {self.tf}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Entry  : <code>{fmt_price(signal['entry'])}</code>\n"
-                f"SL     : <code>{fmt_price(signal['sl'])}</code>  "
-                f"(−{self.s['sl_mult']}×ATR)\n"
-                f"TP     : <code>{fmt_price(signal['tp'])}</code>  "
-                f"(+{rr}×ATR)\n"
-                f"ATR    : <code>{fmt_price(signal['atr'])}</code>\n"
-                f"SL dist: <code>{fmt_price(signal['entry']-signal['sl'])}</code>  "
-                f"({(signal['entry']-signal['sl'])/signal['entry']*100:.2f}%)\n"
-                f"TP dist: <code>{fmt_price(signal['tp']-signal['entry'])}</code>  "
-                f"({(signal['tp']-signal['entry'])/signal['entry']*100:.2f}%)\n"
-                f"Sell bricks before: {signal['sell_run']}\n"
-                f"⏰ {now_utc()}"
-            )
-            print(f"{tag} 🟢 BUY signal | Entry: {signal['entry']:.4f} | "
-                  f"SL: {signal['sl']:.4f} | TP: {signal['tp']:.4f}")
-        else:
-            print(f"{tag} 👀 No signal | Bricks: {new_n} | "
-                  f"Last close: {closes[-1]:.4f}")
+                    if not dup:
+                        sl = entry - cfg["sl_mult"] * atr
+                        tp = entry + cfg["tp_mult"] * cfg["sl_mult"] * atr
+                        open_trade = {
+                            "entry": entry, "sl": sl, "tp": tp, "atr": atr,
+                            "entry_idx": entry_idx,
+                            "entry_time": times[entry_idx],
+                            "sell_run": sell_run,
+                        }
+                sell_run = 0
+            i += 1
+            continue
 
-    # ── heartbeat ────────────────────────────────────────────
-    def _heartbeat(self):
-        tag   = f"[{self.symbol} {self.tf}]"
-        price = fetch_current_price(self.symbol)
-        in_t  = "YES" if self.trade else "NO"
-        wr    = (f"{self.wins}/{self.total_trades} "
-                 f"({100*self.wins/self.total_trades:.1f}%)"
-                 if self.total_trades else "No trades yet")
+        # ── we're in a trade: scan forward candle-by-candle for exit ──
+        t = open_trade
+        exit_found = False
+        for j in range(t["entry_idx"] + 1, len(closes)):
+            hit_tp = highs[j] >= t["tp"]
+            hit_sl = lows[j]  <= t["sl"]
 
-        msg = (
-            f"💓 <b>Heartbeat</b> — {self.symbol} {self.tf}\n"
-            f"Price    : <code>{fmt_price(price)}</code>\n"
-            f"In trade : {in_t}\n"
-            f"Win rate : {wr}\n"
-            f"⏰ {now_utc()}"
-        )
-        if self.trade:
-            t   = self.trade
-            pct = (price - t["entry"]) / t["entry"] * 100
-            msg += (
-                f"\n\n📌 Open Trade\n"
-                f"Entry: <code>{fmt_price(t['entry'])}</code>\n"
-                f"SL   : <code>{fmt_price(t['sl'])}</code>\n"
-                f"TP   : <code>{fmt_price(t['tp'])}</code>\n"
-                f"P&L  : <b>{pct:+.2f}%</b>"
-            )
+            if hit_tp and hit_sl:
+                outcome = cfg["exit_priority"]   # ambiguous same-candle case
+            elif hit_tp:
+                outcome = "TP"
+            elif hit_sl:
+                outcome = "SL"
+            else:
+                continue
 
-        send_tg(msg)
-        print(f"{tag} 💓 Heartbeat | Price: {price:.4f} | "
-              f"Trade: {in_t} | {wr}")
+            exit_price = t["tp"] if outcome == "TP" else t["sl"]
+            gross_pct  = (exit_price - t["entry"]) / t["entry"]
+            net_pct    = gross_pct - 2 * fee_slip   # entry + exit friction
+
+            trades.append({
+                "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
+                "exit_time" : datetime.fromtimestamp(times[j]/1000, tz=timezone.utc),
+                "entry"     : t["entry"],
+                "sl"        : t["sl"],
+                "tp"        : t["tp"],
+                "atr"       : t["atr"],
+                "outcome"   : outcome,
+                "gross_pct" : gross_pct * 100,
+                "net_pct"   : net_pct * 100,
+                "bars_held" : j - t["entry_idx"],
+            })
+
+            last_entry_price = t["entry"]
+            open_trade = None
+            exit_found = True
+            break
+
+        if not exit_found:
+            # trade never closed within available data (still "open" at end)
+            trades.append({
+                "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
+                "exit_time" : None,
+                "entry"     : t["entry"],
+                "sl"        : t["sl"],
+                "tp"        : t["tp"],
+                "atr"       : t["atr"],
+                "outcome"   : "OPEN_AT_END",
+                "gross_pct" : (closes[-1] - t["entry"]) / t["entry"] * 100,
+                "net_pct"   : ((closes[-1] - t["entry"]) / t["entry"] - fee_slip) * 100,
+                "bars_held" : len(closes) - 1 - t["entry_idx"],
+            })
+            open_trade = None
+
+        i += 1
+
+    return trades
 
 
 # ─────────────────────────────────────────────────────────────
-#  MAIN — spin up one thread per timeframe
+#  PERFORMANCE SUMMARY
 # ─────────────────────────────────────────────────────────────
-def main():
-    print(__doc__)
-    s = SETTINGS
+def summarize(trades: list, cfg: dict):
+    if not trades:
+        print("\nNo trades were generated over this period — "
+              "try loosening min_sell_bricks or the lookback window.")
+        return None
 
-    # Send a single startup message listing both timeframes
-    send_tg(
-        f"🤖 <b>SOL Renko ATR Forward Tester</b>\n"
-        f"Launching workers for: "
-        f"{', '.join(s['timeframes'])}\n"
-        f"Symbol: <code>{s['symbol']}</code>\n"
-        f"⏰ {now_utc()}"
-    )
+    df = pd.DataFrame(trades)
+    closed = df[df["outcome"] != "OPEN_AT_END"]
 
-    threads = []
-    for tf in s["timeframes"]:
-        worker = RenkoWorker(s["symbol"], tf, s)
-        t = threading.Thread(
-            target=worker.run,
-            name=f"Worker-{tf}",
-            daemon=True,
-        )
-        t.start()
-        threads.append(t)
-        print(f"[MAIN] Started thread for {tf}")
-        time.sleep(2)   # stagger starts slightly
+    n_total  = len(df)
+    n_closed = len(closed)
+    n_tp     = (closed["outcome"] == "TP").sum()
+    n_sl     = (closed["outcome"] == "SL").sum()
+    win_rate = n_tp / n_closed * 100 if n_closed else 0.0
 
-    # Keep main thread alive
-    try:
-        while True:
-            time.sleep(60)
-            # Print a console status line every minute
-            alive = [t.name for t in threads if t.is_alive()]
-            print(f"[MAIN] {now_utc()} | Alive threads: {alive}")
-    except KeyboardInterrupt:
-        print("\n[MAIN] Shutting down…")
-        send_tg(
-            f"🛑 <b>Forward Tester Stopped</b>\n"
-            f"Symbol: {s['symbol']}\n"
-            f"⏰ {now_utc()}"
-        )
+    gains = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
+    losses = -closed.loc[closed["net_pct"] < 0, "net_pct"].sum()
+    profit_factor = gains / losses if losses > 0 else float("inf")
+
+    avg_win  = closed.loc[closed["net_pct"] > 0, "net_pct"].mean() if n_tp else 0
+    avg_loss = closed.loc[closed["net_pct"] < 0, "net_pct"].mean() if n_sl else 0
+    expectancy = closed["net_pct"].mean() if n_closed else 0
+
+    # equity curve (compounding, risk_pct_per_trade of capital per trade)
+    equity = cfg["initial_capital"]
+    curve = [equity]
+    risk_frac = cfg["risk_pct_per_trade"] / 100.0
+    for pct in closed["net_pct"]:
+        equity *= (1 + (pct / 100.0) * risk_frac)
+        curve.append(equity)
+    curve = np.array(curve)
+
+    running_max = np.maximum.accumulate(curve)
+    drawdowns = (curve - running_max) / running_max * 100
+    max_dd = drawdowns.min()
+
+    total_return_pct = (curve[-1] / curve[0] - 1) * 100
+
+    print("\n" + "═" * 60)
+    print(f"  BACKTEST SUMMARY — {cfg['symbol']} {cfg['timeframe']} "
+          f"({cfg['lookback_days']}d)")
+    print("═" * 60)
+    print(f"  Params        : ATR({cfg['atr_period']}) | "
+          f"brick={cfg['renko_mult']}xATR | SL={cfg['sl_mult']}xATR | "
+          f"TP={cfg['tp_mult']}xSL | min_sell={cfg['min_sell_bricks']}")
+    print(f"  Total signals : {n_total}  ({n_closed} closed, "
+          f"{n_total - n_closed} still open at data end)")
+    print(f"  Wins / Losses : {n_tp} / {n_sl}")
+    print(f"  Win rate      : {win_rate:.1f}%")
+    print(f"  Avg win       : {avg_win:+.2f}%")
+    print(f"  Avg loss      : {avg_loss:+.2f}%")
+    print(f"  Expectancy/tr : {expectancy:+.3f}%")
+    print(f"  Profit factor : {profit_factor:.2f}")
+    print(f"  Total return  : {total_return_pct:+.1f}%  "
+          f"(${cfg['initial_capital']:.0f} → ${curve[-1]:.0f})")
+    print(f"  Max drawdown  : {max_dd:.1f}%")
+    print(f"  Avg bars held : {closed['bars_held'].mean():.1f}")
+    print("═" * 60)
+
+    return {"df": df, "curve": curve, "max_dd": max_dd,
+            "total_return_pct": total_return_pct}
+
+
+# ─────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────
+def main(cfg=None):
+    cfg = cfg or CONFIG
+
+    opens, highs, lows, closes, times = fetch_historical_klines(
+        cfg["symbol"], cfg["timeframe"], cfg["lookback_days"])
+
+    atr_arr = calc_atr(highs, lows, closes, cfg["atr_period"])
+    bricks  = build_renko(closes, atr_arr, cfg["renko_mult"])
+    print(f"[RENKO] Built {len(bricks)} bricks from {len(closes)} candles")
+
+    trades = run_backtest(highs, lows, closes, times, bricks, cfg)
+    result = summarize(trades, cfg)
+
+    if result is not None:
+        out_csv = "/mnt/user-data/outputs/renko_backtest_trades.csv"
+        result["df"].to_csv(out_csv, index=False)
+        print(f"\nSaved trade log → {out_csv}")
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(result["curve"], color="#2563eb", linewidth=1.5)
+            ax.set_title(f"{cfg['symbol']} {cfg['timeframe']} Renko-ATR — "
+                         f"Equity Curve ({cfg['lookback_days']}d)")
+            ax.set_xlabel("Trade #")
+            ax.set_ylabel("Equity ($)")
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            out_png = "/mnt/user-data/outputs/renko_backtest_equity_curve.png"
+            fig.savefig(out_png, dpi=150)
+            print(f"Saved equity curve → {out_png}")
+        except Exception as e:
+            print(f"[WARN] Could not save equity curve chart: {e}")
+
+    return trades, result
 
 
 if __name__ == "__main__":
     main()
+  
