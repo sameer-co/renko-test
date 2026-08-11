@@ -16,7 +16,7 @@ What it does:
      reflects what would really have happened.
   5. Prints a performance summary and saves an equity curve chart.
 
-Every strategy parameter lives in CONFIG below — nothing else needs
+Every strategy parameter lives in CONFIG below — nothing else nee
 to be touched to test a different symbol, timeframe, ATR period,
 brick size, SL/TP multiples, or lookback window.
 """
