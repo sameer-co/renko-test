@@ -38,7 +38,7 @@ CONFIG = {
     "atr_period"      : 14,
     "renko_mult"      : 1.0,      # brick size = renko_mult x ATR
     "sl_mult"         : 1,      # SL = sl_mult x ATR below entry
-    "tp_mult"         : 2.5,        # TP = tp_mult x SL above entry
+    "tp_mult"         : 4.5,        # TP = tp_mult x SL above entry
     "min_sell_bricks" : 2,        # min consecutive bearish bricks before entry
     "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
 
