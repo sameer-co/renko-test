@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 #  CONFIG — everything you'd want to change lives here
 # ─────────────────────────────────────────────────────────────
 CONFIG = {
-    "symbol"          : "JUPUSDT",
+    "symbol"          : "BTCUSDT",
     "timeframe"       : "30m",     # any Binance interval: 1m,3m,5m,15m,30m,1h,4h,1d ...
     "lookback_days"   : 365,      # how far back to backtest
 
