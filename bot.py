@@ -6,59 +6,7 @@
 
 CHANGELOG — fixes applied vs the original version
 ---------------------------------------------------
-1. [CRITICAL] Trade chronology: the outer loop now skips every Renko
-   brick that formed *while a trade was open* instead of advancing
-   one brick at a time. Previously, after a trade closed at candle
-   index j, the loop resumed at bricks[i+1] even if that brick had
-   formed at an earlier candle index than j — meaning the backtest
-   could "notice" and act on signals that (in real time) occurred
-   concurrently with an already-open position. This silently let
-   trades overlap in a way the live one-trade-at-a-time bot never
-   would, and inflated trade counts / results.
 
-2. [HIGH] Position sizing: risk_pct_per_trade previously scaled the
-   trade's raw % return directly — it had nothing to do with the SL
-   distance, so it was not "risk-based" despite the name/comment.
-   Position size is now derived from the actual SL distance so that
-   risk_pct_per_trade really is the % of capital at stake if the SL
-   is hit (position_sizing_mode="risk_based"), with a max_leverage
-   cap. The old behaviour is preserved as position_sizing_mode=
-   "fixed_fraction" for anyone who wants it.
-
-3. [HIGH] Slippage: previously lumped into a single flat % (fee_pct +
-   slippage_pct) subtracted from the % return, applied identically to
-   TP and SL exits. Slippage is now applied directly to the entry and
-   exit fill prices (worse fill in the disadvantageous direction each
-   time), and fees are kept as a separate, explicit per-side cost.
-
-4. [MEDIUM] Open-at-end trades: now computed with the same entry-fill
-   logic (incl. entry slippage) as closed trades, and correctly charge
-   only ONE side of fees (entry only — no exit has happened yet)
-   instead of an ambiguous partial "fee_slip" figure.
-
-5. [MEDIUM] TP definition / naming: tp_mult was really a risk:reward
-   ratio (TP distance = tp_mult × SL distance), not a multiple of ATR.
-   Renamed to risk_reward_ratio and the math is now explicit
-   (sl_dist computed once, tp = entry + risk_reward_ratio * sl_dist).
-
-6. [MEDIUM] Same-candle TP+SL ambiguity: previously always resolved
-   by a static config choice ("SL" or "TP"). Now defaults to a
-   heuristic ("exit_priority": "heuristic") that infers the likely
-   intrabar path from whether the candle closed above or below its
-   open (bullish → low visited before high, bearish → high before
-   low), while still allowing "SL"/"TP" to force the old conservative
-   / optimistic behaviour.
-
-7. [MEDIUM] Long/short handling: strategy was long-only. Added an
-   opt-in allow_shorts flag that mirrors the long entry logic for
-   bearish reversals after a run of bullish bricks, fully wired
-   through signal generation, exits, fees/slippage, and sizing.
-
-8. [LOW/INFO] Renko construction: brick size re-anchors to the most
-   recent ATR every time a new brick forms (adaptive sizing). This is
-   a legitimate strategy choice, not a bug — left as-is but documented
-   here since it materially changes brick counts vs a "fixed ATR at
-   signal time" scheme.
 
 9. [LOW] Historical fetch: added a guard against a stalled cursor
    (Binance returning a page that doesn't advance startTime), which
@@ -90,8 +38,8 @@ CONFIG = {
     "min_buy_bricks"  : 2,         # min consecutive bullish bricks before a SHORT entry
 
     # execution assumptions
-    "fee_pct"         : 0.04,      # taker fee, % of notional PER SIDE (0.04 = 0.04%, i.e. 4bps)
-    "slippage_pct"    : 0.04,      # slippage, % applied to the actual fill price PER SIDE
+    "fee_pct"         : 0.02,      # taker fee, % of notional PER SIDE (0.04 = 0.04%, i.e. 4bps)
+    "slippage_pct"    : 0.02,      # slippage, % applied to the actual fill price PER SIDE
     "exit_priority"   : "heuristic",  # "heuristic" (infer from candle open/close) or force "SL"/"TP"
                                        # for any single candle that touches both TP and SL
 
