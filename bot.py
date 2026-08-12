@@ -4,21 +4,65 @@
 ║  Same signal logic as the live forward tester, run over history  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-What it does:
-  1. Downloads N days of historical candles from Binance (paginated).
-  2. Builds ATR + ATR-based Renko bricks (identical logic to your bot).
-  3. Walks the bricks, opens a trade on the same BUY signal condition
-     (bullish brick after >= min_sell_bricks bearish ones, with the
-     same duplicate-entry ATR-gap guard).
-  4. Determines the exit (TP or SL only — simple fixed exits, no
-     trailing stop) using intrabar HIGH/LOW of the candles that
-     follow the entry — not just candle closes — so the backtest
-     reflects what would really have happened.
-  5. Prints a performance summary and saves an equity curve chart.
+CHANGELOG — fixes applied vs the original version
+---------------------------------------------------
+1. [CRITICAL] Trade chronology: the outer loop now skips every Renko
+   brick that formed *while a trade was open* instead of advancing
+   one brick at a time. Previously, after a trade closed at candle
+   index j, the loop resumed at bricks[i+1] even if that brick had
+   formed at an earlier candle index than j — meaning the backtest
+   could "notice" and act on signals that (in real time) occurred
+   concurrently with an already-open position. This silently let
+   trades overlap in a way the live one-trade-at-a-time bot never
+   would, and inflated trade counts / results.
 
-Every strategy parameter lives in CONFIG below — nothing else nee
-to be touched to test a different symbol, timeframe, ATR period,
-brick size, SL/TP multiples, or lookback window.
+2. [HIGH] Position sizing: risk_pct_per_trade previously scaled the
+   trade's raw % return directly — it had nothing to do with the SL
+   distance, so it was not "risk-based" despite the name/comment.
+   Position size is now derived from the actual SL distance so that
+   risk_pct_per_trade really is the % of capital at stake if the SL
+   is hit (position_sizing_mode="risk_based"), with a max_leverage
+   cap. The old behaviour is preserved as position_sizing_mode=
+   "fixed_fraction" for anyone who wants it.
+
+3. [HIGH] Slippage: previously lumped into a single flat % (fee_pct +
+   slippage_pct) subtracted from the % return, applied identically to
+   TP and SL exits. Slippage is now applied directly to the entry and
+   exit fill prices (worse fill in the disadvantageous direction each
+   time), and fees are kept as a separate, explicit per-side cost.
+
+4. [MEDIUM] Open-at-end trades: now computed with the same entry-fill
+   logic (incl. entry slippage) as closed trades, and correctly charge
+   only ONE side of fees (entry only — no exit has happened yet)
+   instead of an ambiguous partial "fee_slip" figure.
+
+5. [MEDIUM] TP definition / naming: tp_mult was really a risk:reward
+   ratio (TP distance = tp_mult × SL distance), not a multiple of ATR.
+   Renamed to risk_reward_ratio and the math is now explicit
+   (sl_dist computed once, tp = entry + risk_reward_ratio * sl_dist).
+
+6. [MEDIUM] Same-candle TP+SL ambiguity: previously always resolved
+   by a static config choice ("SL" or "TP"). Now defaults to a
+   heuristic ("exit_priority": "heuristic") that infers the likely
+   intrabar path from whether the candle closed above or below its
+   open (bullish → low visited before high, bearish → high before
+   low), while still allowing "SL"/"TP" to force the old conservative
+   / optimistic behaviour.
+
+7. [MEDIUM] Long/short handling: strategy was long-only. Added an
+   opt-in allow_shorts flag that mirrors the long entry logic for
+   bearish reversals after a run of bullish bricks, fully wired
+   through signal generation, exits, fees/slippage, and sizing.
+
+8. [LOW/INFO] Renko construction: brick size re-anchors to the most
+   recent ATR every time a new brick forms (adaptive sizing). This is
+   a legitimate strategy choice, not a bug — left as-is but documented
+   here since it materially changes brick counts vs a "fixed ATR at
+   signal time" scheme.
+
+9. [LOW] Historical fetch: added a guard against a stalled cursor
+   (Binance returning a page that doesn't advance startTime), which
+   could previously spin in an infinite loop.
 """
 
 import time
@@ -36,19 +80,28 @@ CONFIG = {
     "lookback_days"   : 1095,      # how far back to backtest
 
     "atr_period"      : 14,
-    "renko_mult"      : 1.0,      # brick size = renko_mult x ATR
-    "sl_mult"         : 1.5,      # SL = sl_mult x ATR below entry
-    "tp_mult"         : 3.5,        # TP = tp_mult x SL above entry
-    "min_sell_bricks" : 2,        # min consecutive bearish bricks before entry
-    "atr_gap_mult"    : 1.0,      # duplicate-entry guard, same as live bot
+    "renko_mult"      : 1.0,       # brick size = renko_mult x ATR (re-anchored per new brick)
+    "sl_mult"         : 1.5,       # SL distance = sl_mult x ATR
+    "risk_reward_ratio": 3.5,      # TP distance = risk_reward_ratio x SL distance (renamed from tp_mult)
+    "min_sell_bricks" : 2,         # min consecutive bearish bricks before a LONG entry
+    "atr_gap_mult"    : 1.0,       # duplicate-entry guard, same as live bot
 
-    # execution assumptions (set to 0 to test the "perfect fill" case)
-    "fee_pct"         : 0.04,     # taker fee per side, % (Binance spot default ~0.1%, many use 0.04% w/ BNB)
-    "slippage_pct"    : 0.04,     # extra slippage per side, %
-    "exit_priority"   : "SL",     # if a single candle's range touches BOTH tp & sl: "SL" (conservative) or "TP"
+    "allow_shorts"    : False,     # if True, also take SHORT trades on bearish reversals
+    "min_buy_bricks"  : 2,         # min consecutive bullish bricks before a SHORT entry
 
-    "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
-    "risk_pct_per_trade": 100.0,  # % of capital "risked" per trade for equity curve (100 = full compounding)
+    # execution assumptions
+    "fee_pct"         : 0.04,      # taker fee, % of notional PER SIDE (0.04 = 0.04%, i.e. 4bps)
+    "slippage_pct"    : 0.04,      # slippage, % applied to the actual fill price PER SIDE
+    "exit_priority"   : "heuristic",  # "heuristic" (infer from candle open/close) or force "SL"/"TP"
+                                       # for any single candle that touches both TP and SL
+
+    "initial_capital" : 1000.0,       # USD, starting equity for the curve
+    "position_sizing_mode": "risk_based",  # "risk_based": size the position so the SL distance
+                                            #    equals risk_pct_per_trade of capital.
+                                            # "fixed_fraction": always allocate risk_pct_per_trade
+                                            #    of capital regardless of SL distance (legacy behaviour).
+    "risk_pct_per_trade": 2.0,        # meaning depends on position_sizing_mode above
+    "max_leverage"    : 3.0,          # cap on position size as a multiple of capital
 }
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
@@ -92,7 +145,12 @@ def fetch_historical_klines(symbol: str, interval: str, lookback_days: int):
 
         all_rows.extend(rows)
         last_open_time = rows[-1][0]
-        cursor = last_open_time + step_ms
+        new_cursor = last_open_time + step_ms
+
+        # FIX (low sev.): guard against a stalled cursor -> infinite loop
+        if new_cursor <= cursor:
+            break
+        cursor = new_cursor
 
         # be polite to the API
         time.sleep(0.25)
@@ -151,6 +209,10 @@ def calc_atr(highs, lows, closes, period: int) -> np.ndarray:
 
 # ─────────────────────────────────────────────────────────────
 #  RENKO BUILDER — identical to the live bot, keeps candle idx
+#  NOTE: brick size re-anchors to the latest ATR each time a new
+#  brick forms (adaptive sizing). This is a deliberate strategy
+#  choice inherited from the live bot, not a bug — flagged here
+#  because it materially affects brick counts vs a fixed-ATR scheme.
 # ─────────────────────────────────────────────────────────────
 def build_renko(closes, atr_arr, mult: float):
     bricks  = []
@@ -187,6 +249,41 @@ def build_renko(closes, atr_arr, mult: float):
 
 
 # ─────────────────────────────────────────────────────────────
+#  EXIT-AMBIGUITY RESOLUTION
+#  When a single candle's range touches BOTH TP and SL, we don't
+#  know which was hit first. "heuristic" infers a likely intrabar
+#  path from the candle's open/close (bullish => low visited before
+#  high; bearish => high before low). "SL"/"TP" force the old
+#  static behaviour if you want the conservative / optimistic case.
+# ─────────────────────────────────────────────────────────────
+def resolve_ambiguous_exit(cfg, open_price, close_price, side):
+    mode = cfg.get("exit_priority", "heuristic")
+    if mode in ("SL", "TP"):
+        return mode
+
+    bullish = close_price >= open_price
+    if side == "LONG":
+        # bullish candle: low before high -> SL (below) hit first
+        # bearish candle: high before low -> TP (above) hit first
+        return "SL" if bullish else "TP"
+    else:  # SHORT
+        # bullish candle: low before high -> TP (below, for a short) hit first
+        # bearish candle: high before low -> SL (above, for a short) hit first
+        return "TP" if bullish else "SL"
+
+
+def apply_fill_prices(side, entry, exit_price, slip_frac):
+    """Slippage moves each fill against you, applied directly to price."""
+    if side == "LONG":
+        entry_fill = entry * (1 + slip_frac)        # buying costs slightly more
+        exit_fill  = exit_price * (1 - slip_frac)    # selling nets slightly less
+    else:  # SHORT
+        entry_fill = entry * (1 - slip_frac)         # selling short nets slightly less
+        exit_fill  = exit_price * (1 + slip_frac)     # buying back costs slightly more
+    return entry_fill, exit_fill
+
+
+# ─────────────────────────────────────────────────────────────
 #  BACKTEST ENGINE
 #  Walks bricks in time order. Same signal condition + duplicate
 #  guard as the live bot. Once a trade is open, no new signals are
@@ -194,65 +291,97 @@ def build_renko(closes, atr_arr, mult: float):
 #  only tracking one open trade at a time). Exit is a plain fixed
 #  TP or SL — no trailing-stop logic.
 # ─────────────────────────────────────────────────────────────
-def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
+def run_backtest(opens, highs, lows, closes, times, bricks, cfg: dict):
     trades = []
-    sell_run = 0
+    sell_run = 0   # consecutive bearish bricks -> feeds LONG entries
+    buy_run  = 0   # consecutive bullish bricks -> feeds SHORT entries
     open_trade = None
     last_entry_price = 0.0
-    fee_slip = (cfg["fee_pct"] + cfg["slippage_pct"]) / 100.0  # per side
+
+    fee_frac  = cfg["fee_pct"] / 100.0
+    slip_frac = cfg["slippage_pct"] / 100.0
+    allow_shorts = cfg.get("allow_shorts", False)
 
     i = 0
-    while i < len(bricks):
+    n_bricks = len(bricks)
+    while i < n_bricks:
         b = bricks[i]
 
         if open_trade is None:
             if b["dir"] == -1:
-                sell_run += 1
-            else:
-                if sell_run >= cfg["min_sell_bricks"]:
-                    entry     = b["close"]
-                    atr       = b["atr"]
+                # ---- possible SHORT entry: bearish brick after a bullish run ----
+                if allow_shorts and buy_run >= cfg["min_buy_bricks"]:
+                    entry = b["close"]
+                    atr = b["atr"]
                     entry_idx = b["idx"]
-
                     dup = (last_entry_price > 0 and
                            abs(entry - last_entry_price) < cfg["atr_gap_mult"] * atr)
-
                     if not dup:
-                        sl = entry - cfg["sl_mult"] * atr
-                        tp = entry + cfg["tp_mult"] * cfg["sl_mult"] * atr
+                        sl_dist = cfg["sl_mult"] * atr
+                        sl = entry + sl_dist
+                        tp = entry - cfg["risk_reward_ratio"] * sl_dist
                         open_trade = {
-                            "entry": entry, "sl": sl, "tp": tp, "atr": atr,
-                            "entry_idx": entry_idx,
-                            "entry_time": times[entry_idx],
-                            "sell_run": sell_run,
+                            "side": "SHORT", "entry": entry, "sl": sl, "tp": tp, "atr": atr,
+                            "entry_idx": entry_idx, "entry_time": times[entry_idx],
+                        }
+                buy_run = 0
+                sell_run += 1
+            else:
+                # ---- possible LONG entry: bullish brick after a bearish run ----
+                if sell_run >= cfg["min_sell_bricks"]:
+                    entry = b["close"]
+                    atr = b["atr"]
+                    entry_idx = b["idx"]
+                    dup = (last_entry_price > 0 and
+                           abs(entry - last_entry_price) < cfg["atr_gap_mult"] * atr)
+                    if not dup:
+                        sl_dist = cfg["sl_mult"] * atr
+                        sl = entry - sl_dist
+                        tp = entry + cfg["risk_reward_ratio"] * sl_dist
+                        open_trade = {
+                            "side": "LONG", "entry": entry, "sl": sl, "tp": tp, "atr": atr,
+                            "entry_idx": entry_idx, "entry_time": times[entry_idx],
                         }
                 sell_run = 0
+                buy_run += 1
             i += 1
             continue
 
         # ── we're in a trade: scan forward candle-by-candle for exit ──
         t = open_trade
         exit_found = False
+        exit_j = None
 
         for j in range(t["entry_idx"] + 1, len(closes)):
-            hit_tp = highs[j] >= t["tp"]
-            hit_sl = lows[j]  <= t["sl"]
-
-            if hit_tp and hit_sl:
-                # same candle touches both — ambiguous, use configured priority
-                outcome = cfg["exit_priority"]
-                exit_price = t["tp"] if outcome == "TP" else t["sl"]
-            elif hit_tp:
-                outcome, exit_price = "TP", t["tp"]
-            elif hit_sl:
-                outcome, exit_price = "SL", t["sl"]
+            if t["side"] == "LONG":
+                hit_tp = highs[j] >= t["tp"]
+                hit_sl = lows[j]  <= t["sl"]
             else:
+                hit_tp = lows[j]  <= t["tp"]
+                hit_sl = highs[j] >= t["sl"]
+
+            if not (hit_tp or hit_sl):
                 continue
 
-            gross_pct = (exit_price - t["entry"]) / t["entry"]
-            net_pct   = gross_pct - 2 * fee_slip   # entry + exit friction
+            if hit_tp and hit_sl:
+                outcome = resolve_ambiguous_exit(cfg, opens[j], closes[j], t["side"])
+            elif hit_tp:
+                outcome = "TP"
+            else:
+                outcome = "SL"
+
+            exit_price = t["tp"] if outcome == "TP" else t["sl"]
+            entry_fill, exit_fill = apply_fill_prices(t["side"], t["entry"], exit_price, slip_frac)
+
+            if t["side"] == "LONG":
+                gross_pct = (exit_fill - entry_fill) / entry_fill
+            else:
+                gross_pct = (entry_fill - exit_fill) / entry_fill
+
+            net_pct = gross_pct - 2 * fee_frac   # fee charged on entry AND exit
 
             trades.append({
+                "side"      : t["side"],
                 "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
                 "exit_time" : datetime.fromtimestamp(times[j]/1000, tz=timezone.utc),
                 "entry"     : t["entry"],
@@ -268,11 +397,31 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
             last_entry_price = t["entry"]
             open_trade = None
             exit_found = True
+            exit_j = j
             break
 
-        if not exit_found:
+        if exit_found:
+            # FIX (CRITICAL): skip every brick that formed WHILE this trade
+            # was open. Those bricks occurred concurrently with a position
+            # the live bot would never have acted on (one trade at a time),
+            # so they must not be replayed as signals once the trade closes.
+            while i < n_bricks and bricks[i]["idx"] <= exit_j:
+                i += 1
+            sell_run = 0
+            buy_run = 0
+            continue
+        else:
             # trade never closed within available data (still "open" at end)
+            side = t["side"]
+            entry_fill, _ = apply_fill_prices(side, t["entry"], t["entry"], slip_frac)
+            if side == "LONG":
+                gross_pct = (closes[-1] - entry_fill) / entry_fill
+            else:
+                gross_pct = (entry_fill - closes[-1]) / entry_fill
+            net_pct = gross_pct - fee_frac  # FIX (medium): only entry-side fee has actually been paid
+
             trades.append({
+                "side"      : side,
                 "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
                 "exit_time" : None,
                 "entry"     : t["entry"],
@@ -280,13 +429,12 @@ def run_backtest(highs, lows, closes, times, bricks, cfg: dict):
                 "tp"        : t["tp"],
                 "atr"       : t["atr"],
                 "outcome"   : "OPEN_AT_END",
-                "gross_pct" : (closes[-1] - t["entry"]) / t["entry"] * 100,
-                "net_pct"   : ((closes[-1] - t["entry"]) / t["entry"] - fee_slip) * 100,
+                "gross_pct" : gross_pct * 100,
+                "net_pct"   : net_pct * 100,
                 "bars_held" : len(closes) - 1 - t["entry_idx"],
             })
             open_trade = None
-
-        i += 1
+            break  # no more candle data left to resolve anything further
 
     return trades
 
@@ -309,7 +457,6 @@ def summarize(trades: list, cfg: dict):
     n_sl     = (closed["outcome"] == "SL").sum()
 
     win_rate  = n_tp / n_closed * 100 if n_closed else 0.0
-    loss_rate = n_sl / n_closed * 100 if n_closed else 0.0
 
     gains  = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
     losses = -closed.loc[closed["net_pct"] < 0, "net_pct"].sum()
@@ -319,12 +466,25 @@ def summarize(trades: list, cfg: dict):
     avg_loss  = closed.loc[closed["outcome"] == "SL", "net_pct"].mean() if n_sl else 0
     expectancy = closed["net_pct"].mean() if n_closed else 0
 
-    # equity curve (compounding, risk_pct_per_trade of capital per trade)
+    # ---- equity curve ----
+    # FIX (HIGH): position size now actually derives from the SL distance
+    # in "risk_based" mode, so risk_pct_per_trade truly reflects capital
+    # at risk if the stop is hit. "fixed_fraction" keeps the old behaviour
+    # (allocate a flat % of capital to every trade's raw return).
+    mode = cfg.get("position_sizing_mode", "risk_based")
+    risk_frac_cfg = cfg["risk_pct_per_trade"] / 100.0
+    max_lev = cfg.get("max_leverage", 1.0)
+
     equity = cfg["initial_capital"]
     curve = [equity]
-    risk_frac = cfg["risk_pct_per_trade"] / 100.0
-    for pct in closed["net_pct"]:
-        equity *= (1 + (pct / 100.0) * risk_frac)
+    for _, row in closed.iterrows():
+        sl_dist_pct = abs(row["entry"] - row["sl"]) / row["entry"]
+        if mode == "risk_based":
+            position_fraction = 0.0 if sl_dist_pct <= 0 else min(risk_frac_cfg / sl_dist_pct, max_lev)
+        else:  # fixed_fraction (legacy behaviour)
+            position_fraction = min(risk_frac_cfg, max_lev)
+
+        equity *= (1 + (row["net_pct"] / 100.0) * position_fraction)
         curve.append(equity)
     curve = np.array(curve)
 
@@ -340,7 +500,10 @@ def summarize(trades: list, cfg: dict):
     print("═" * 60)
     print(f"  Params        : ATR({cfg['atr_period']}) | "
           f"brick={cfg['renko_mult']}xATR | SL={cfg['sl_mult']}xATR | "
-          f"TP={cfg['tp_mult']}xSL | min_sell={cfg['min_sell_bricks']}")
+          f"R:R={cfg['risk_reward_ratio']} | min_sell={cfg['min_sell_bricks']} | "
+          f"shorts={'on' if cfg.get('allow_shorts') else 'off'}")
+    print(f"  Sizing        : mode={mode} | risk_pct_per_trade={cfg['risk_pct_per_trade']}% "
+          f"| max_leverage={max_lev}x")
     print(f"  Total signals : {n_total}  ({n_closed} closed, "
           f"{n_total - n_closed} still open at data end)")
     print(f"  Wins / Losses : {n_tp} / {n_sl}")
@@ -372,7 +535,7 @@ def main(cfg=None):
     bricks  = build_renko(closes, atr_arr, cfg["renko_mult"])
     print(f"[RENKO] Built {len(bricks)} bricks from {len(closes)} candles")
 
-    trades = run_backtest(highs, lows, closes, times, bricks, cfg)
+    trades = run_backtest(opens, highs, lows, closes, times, bricks, cfg)
     result = summarize(trades, cfg)
 
     if result is not None:
