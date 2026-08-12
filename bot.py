@@ -44,7 +44,7 @@ CONFIG = {
 
     # execution assumptions (set to 0 to test the "perfect fill" case)
     "fee_pct"         : 0.02,     # taker fee per side, % (Binance spot default ~0.1%, many use 0.04% w/ BNB)
-    "slippage_pct"    : 0.01,     # extra slippage per side, %
+    "slippage_pct"    : 0.02,     # extra slippage per side, %
     "exit_priority"   : "SL",     # if a single candle's range touches BOTH tp & sl: "SL" (conservative) or "TP"
 
     "initial_capital" : 1000.0,   # USD, for equity curve / % return only (no real position sizing)
