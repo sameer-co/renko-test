@@ -1,512 +1,311 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║      Renko ATR Strategy — 1-Year Backtester (Binance Public API) ║
-║  Same signal logic as the live forward tester, run over history  ║
-╚══════════════════════════════════════════════════════════════════╝
+SOL/USDT (Binance Spot) - Price x HMA(50) Crossover Strategy Backtest
+=======================================================================
+Python re-implementation of the Pine Script v6 strategy:
 
-CHANGELOG — fixes applied vs the original version
----------------------------------------------------
+    - Long entry: close crosses above HMA(50), filled at the OPEN of the
+      following candle (matches Pine's default calc_on_every_tick=false).
+    - Stop-loss: the LOW of the crossover candle.
+    - Take-profit: entry_price + tpMult * (entry_price - stop_loss)
+      tpMult = 12 (i.e. TP = 12x the SL distance).
+    - Position sizing: 100% of equity per trade (default_qty_type =
+      strategy.percent_of_equity, default_qty_value = 100), no pyramiding.
+    - Commission: 0.02% per fill (entry AND exit), 0 slippage.
 
+Usage:
+    python sol_hma_backtest.py
 
-9. [LOW] Historical fetch: added a guard against a stalled cursor
-   (Binance returning a page that doesn't advance startTime), which
-   could previously spin in an infinite loop.
+Requires: pandas, numpy, matplotlib, requests
+    pip install pandas numpy matplotlib requests
 """
 
+import os
 import time
+import datetime as dt
+import requests
 import numpy as np
 import pandas as pd
-import requests
-from datetime import datetime, timezone
+import matplotlib.pyplot as plt
 
-# ─────────────────────────────────────────────────────────────
-#  CONFIG — everything you'd want to change lives here
-# ─────────────────────────────────────────────────────────────
-CONFIG = {
-    "symbol"          : "SOLUSDT",
-    "timeframe"       : "30m",     # any Binance interval: 1m,3m,5m,15m,30m,1h,4h,1d ...
-    "lookback_days"   : 1095,      # how far back to backtest
+# ============================== CONFIG ================================
+SYMBOL          = "SOLUSDT"
+INTERVAL        = "5m"
+YEARS_BACK      = 5
+HMA_LEN         = 50
+TP_MULT         = 12.0          # Take Profit = SL distance x 12
+COMMISSION_RATE = 0.0002        # 0.02% per fill
+INITIAL_CAPITAL = 10_000.0
+MIN_TICK        = 0.001         # safety-net risk distance if SL == entry (SOLUSDT tick ~ 0.01, kept conservative)
+CACHE_DIR       = "data_cache"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
-    "atr_period"      : 14,
-    "renko_mult"      : 1.0,       # brick size = renko_mult x ATR (re-anchored per new brick)
-    "sl_mult"         : 1.5,       # SL distance = sl_mult x ATR
-    "risk_reward_ratio": 3.5,      # TP distance = risk_reward_ratio x SL distance (renamed from tp_mult)
-    "min_sell_bricks" : 2,         # min consecutive bearish bricks before a LONG entry
-    "atr_gap_mult"    : 1.0,       # duplicate-entry guard, same as live bot
-
-    "allow_shorts"    : False,     # if True, also take SHORT trades on bearish reversals
-    "min_buy_bricks"  : 2,         # min consecutive bullish bricks before a SHORT entry
-
-    # execution assumptions
-    "fee_pct"         : 0.02,      # taker fee, % of notional PER SIDE (0.04 = 0.04%, i.e. 4bps)
-    "slippage_pct"    : 0.02,      # slippage, % applied to the actual fill price PER SIDE
-    "exit_priority"   : "heuristic",  # "heuristic" (infer from candle open/close) or force "SL"/"TP"
-                                       # for any single candle that touches both TP and SL
-
-    "initial_capital" : 1000.0,       # USD, starting equity for the curve
-    "position_sizing_mode": "risk_based",  # "risk_based": size the position so the SL distance
-                                            #    equals risk_pct_per_trade of capital.
-                                            # "fixed_fraction": always allocate risk_pct_per_trade
-                                            #    of capital regardless of SL distance (legacy behaviour).
-    "risk_pct_per_trade": 2.0,        # meaning depends on position_sizing_mode above
-    "max_leverage"    : 3.0,          # cap on position size as a multiple of capital
-}
-
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-
-INTERVAL_MS = {
-    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
-    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
-    "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
-    "1d": 86_400_000,
-}
+# Assume worst case (stop-loss fills first) when both SL and TP are touched
+# within the same candle. Set to False to assume TP fills first instead.
+CONSERVATIVE_SAME_BAR_FILL = True
 
 
-# ─────────────────────────────────────────────────────────────
-#  HISTORICAL DATA — paginated fetch of `lookback_days`
-# ─────────────────────────────────────────────────────────────
-def fetch_historical_klines(symbol: str, interval: str, lookback_days: int):
-    if interval not in INTERVAL_MS:
-        raise ValueError(f"Unsupported interval '{interval}'. "
-                          f"Choose from: {list(INTERVAL_MS)}")
+# =========================== DATA FETCHING =============================
+def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Paginated fetch of historical klines from Binance public REST API.
+    Caches the result to CSV so repeat runs don't re-download 5 years of data."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(
+        CACHE_DIR, f"{symbol}_{interval}_{start_ms}_{end_ms}.csv"
+    )
+    if os.path.exists(cache_path):
+        print(f"Loading cached data from {cache_path}")
+        df = pd.read_csv(cache_path, parse_dates=["open_time", "close_time"])
+        return df
 
-    step_ms = INTERVAL_MS[interval]
-    end_ms  = int(time.time() * 1000)
-    start_ms = end_ms - lookback_days * 86_400_000
+    print(f"Downloading {symbol} {interval} klines from Binance "
+          f"({dt.datetime.utcfromtimestamp(start_ms/1000)} -> "
+          f"{dt.datetime.utcfromtimestamp(end_ms/1000)}) ...")
 
+    limit = 1000
     all_rows = []
-    cursor = start_ms
-    print(f"[FETCH] {symbol} {interval} — downloading {lookback_days} days...")
+    cur = start_ms
+    session = requests.Session()
 
-    while cursor < end_ms:
+    while cur < end_ms:
         params = {
             "symbol": symbol,
             "interval": interval,
-            "startTime": cursor,
-            "limit": 1000,
+            "startTime": cur,
+            "endTime": end_ms,
+            "limit": limit,
         }
-        r = requests.get(BINANCE_URL, params=params, timeout=15)
-        r.raise_for_status()
-        rows = r.json()
+        for attempt in range(5):
+            try:
+                resp = session.get(BINANCE_KLINES_URL, params=params, timeout=15)
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get("Retry-After", 5))
+                    print(f"Rate limited, sleeping {wait}s...")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                rows = resp.json()
+                break
+            except requests.RequestException as e:
+                print(f"Request failed ({e}), retry {attempt+1}/5...")
+                time.sleep(2 * (attempt + 1))
+        else:
+            raise RuntimeError("Failed to fetch klines after 5 retries")
+
         if not rows:
             break
 
         all_rows.extend(rows)
-        last_open_time = rows[-1][0]
-        new_cursor = last_open_time + step_ms
+        cur = rows[-1][6] + 1  # last candle's close_time + 1ms
+        print(f"  fetched {len(all_rows)} candles, up to "
+              f"{dt.datetime.utcfromtimestamp(cur/1000)}", end="\r")
+        time.sleep(0.15)  # be polite to the rate limit
 
-        # FIX (low sev.): guard against a stalled cursor -> infinite loop
-        if new_cursor <= cursor:
-            break
-        cursor = new_cursor
-
-        # be polite to the API
-        time.sleep(0.25)
-
-        if len(rows) < 1000:
-            break
-
-    if not all_rows:
-        raise RuntimeError("No candles returned — check symbol/interval.")
-
-    # drop the last candle if it's still open (in-progress)
-    if all_rows[-1][6] > end_ms:   # closeTime > now => not closed yet
-        all_rows = all_rows[:-1]
-
-    # de-dupe by open time, keep order
-    seen = set()
-    dedup = []
-    for row in all_rows:
-        if row[0] not in seen:
-            seen.add(row[0])
-            dedup.append(row)
-
-    opens  = np.array([float(c[1]) for c in dedup])
-    highs  = np.array([float(c[2]) for c in dedup])
-    lows   = np.array([float(c[3]) for c in dedup])
-    closes = np.array([float(c[4]) for c in dedup])
-    times  = np.array([int(c[0])   for c in dedup])
-
-    print(f"[FETCH] Got {len(dedup)} candles "
-          f"({datetime.fromtimestamp(times[0]/1000, tz=timezone.utc):%Y-%m-%d} "
-          f"→ {datetime.fromtimestamp(times[-1]/1000, tz=timezone.utc):%Y-%m-%d})")
-    return opens, highs, lows, closes, times
+    print()
+    cols = ["open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore"]
+    df = pd.DataFrame(all_rows, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
+    df.to_csv(cache_path, index=False)
+    return df
 
 
-# ─────────────────────────────────────────────────────────────
-#  ATR (Wilder smoothing) — identical to the live bot
-# ─────────────────────────────────────────────────────────────
-def calc_atr(highs, lows, closes, period: int) -> np.ndarray:
-    n   = len(closes)
-    tr  = np.zeros(n)
-    atr = np.zeros(n)
-    s   = 0.0
-    for i in range(1, n):
-        tr[i] = max(highs[i] - lows[i],
-                    abs(highs[i] - closes[i-1]),
-                    abs(lows[i]  - closes[i-1]))
-        if i < period:
-            s += tr[i]
-        elif i == period:
-            s += tr[i]
-            atr[i] = s / period
-        else:
-            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-    return atr
+# ============================ INDICATORS ================================
+def wma(series: pd.Series, length: int) -> pd.Series:
+    weights = np.arange(1, length + 1)
+    return series.rolling(length).apply(
+        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    )
 
 
-# ─────────────────────────────────────────────────────────────
-#  RENKO BUILDER — identical to the live bot, keeps candle idx
-#  NOTE: brick size re-anchors to the latest ATR each time a new
-#  brick forms (adaptive sizing). This is a deliberate strategy
-#  choice inherited from the live bot, not a bug — flagged here
-#  because it materially affects brick counts vs a fixed-ATR scheme.
-# ─────────────────────────────────────────────────────────────
-def build_renko(closes, atr_arr, mult: float):
-    bricks  = []
-    ref     = None
-    ref_atr = None
-
-    for i in range(len(closes)):
-        a = atr_arr[i]
-        if a == 0:
-            continue
-        if ref is None:
-            ref     = closes[i]
-            ref_atr = a
-            continue
-
-        price    = closes[i]
-        brick_sz = ref_atr * mult
-
-        while price >= ref + brick_sz:
-            bricks.append({"dir": 1, "open": ref, "close": ref + brick_sz,
-                           "idx": i, "atr": ref_atr})
-            ref     += brick_sz
-            ref_atr  = a
-            brick_sz = ref_atr * mult
-
-        while price <= ref - brick_sz:
-            bricks.append({"dir": -1, "open": ref, "close": ref - brick_sz,
-                           "idx": i, "atr": ref_atr})
-            ref     -= brick_sz
-            ref_atr  = a
-            brick_sz = ref_atr * mult
-
-    return bricks
+def hma(series: pd.Series, length: int) -> pd.Series:
+    """Hull Moving Average, matches Pine's ta.hma()."""
+    half_len = max(int(length / 2), 1)
+    sqrt_len = max(int(round(np.sqrt(length))), 1)
+    wma_half = wma(series, half_len)
+    wma_full = wma(series, length)
+    diff = 2 * wma_half - wma_full
+    return wma(diff, sqrt_len)
 
 
-# ─────────────────────────────────────────────────────────────
-#  EXIT-AMBIGUITY RESOLUTION
-#  When a single candle's range touches BOTH TP and SL, we don't
-#  know which was hit first. "heuristic" infers a likely intrabar
-#  path from the candle's open/close (bullish => low visited before
-#  high; bearish => high before low). "SL"/"TP" force the old
-#  static behaviour if you want the conservative / optimistic case.
-# ─────────────────────────────────────────────────────────────
-def resolve_ambiguous_exit(cfg, open_price, close_price, side):
-    mode = cfg.get("exit_priority", "heuristic")
-    if mode in ("SL", "TP"):
-        return mode
+# ============================= BACKTEST ==================================
+def run_backtest(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = df.reset_index(drop=True).copy()
+    df["hma"] = hma(df["close"], HMA_LEN)
+    df["cross_up"] = (df["close"] > df["hma"]) & (df["close"].shift(1) <= df["hma"].shift(1))
 
-    bullish = close_price >= open_price
-    if side == "LONG":
-        # bullish candle: low before high -> SL (below) hit first
-        # bearish candle: high before low -> TP (above) hit first
-        return "SL" if bullish else "TP"
-    else:  # SHORT
-        # bullish candle: low before high -> TP (below, for a short) hit first
-        # bearish candle: high before low -> SL (above, for a short) hit first
-        return "TP" if bullish else "SL"
-
-
-def apply_fill_prices(side, entry, exit_price, slip_frac):
-    """Slippage moves each fill against you, applied directly to price."""
-    if side == "LONG":
-        entry_fill = entry * (1 + slip_frac)        # buying costs slightly more
-        exit_fill  = exit_price * (1 - slip_frac)    # selling nets slightly less
-    else:  # SHORT
-        entry_fill = entry * (1 - slip_frac)         # selling short nets slightly less
-        exit_fill  = exit_price * (1 + slip_frac)     # buying back costs slightly more
-    return entry_fill, exit_fill
-
-
-# ─────────────────────────────────────────────────────────────
-#  BACKTEST ENGINE
-#  Walks bricks in time order. Same signal condition + duplicate
-#  guard as the live bot. Once a trade is open, no new signals are
-#  considered until it exits (matches the live bot's behaviour of
-#  only tracking one open trade at a time). Exit is a plain fixed
-#  TP or SL — no trailing-stop logic.
-# ─────────────────────────────────────────────────────────────
-def run_backtest(opens, highs, lows, closes, times, bricks, cfg: dict):
     trades = []
-    sell_run = 0   # consecutive bearish bricks -> feeds LONG entries
-    buy_run  = 0   # consecutive bullish bricks -> feeds SHORT entries
-    open_trade = None
-    last_entry_price = 0.0
+    equity = INITIAL_CAPITAL
+    equity_curve = np.full(len(df), np.nan)
 
-    fee_frac  = cfg["fee_pct"] / 100.0
-    slip_frac = cfg["slippage_pct"] / 100.0
-    allow_shorts = cfg.get("allow_shorts", False)
+    state = "FLAT"           # FLAT -> PENDING_ENTRY -> IN_POSITION
+    sl_price = None
+    entry_price = None
+    tp_price = None
+    entry_idx = None
 
-    i = 0
-    n_bricks = len(bricks)
-    while i < n_bricks:
-        b = bricks[i]
+    n = len(df)
+    for i in range(n):
+        row = df.iloc[i]
 
-        if open_trade is None:
-            if b["dir"] == -1:
-                # ---- possible SHORT entry: bearish brick after a bullish run ----
-                if allow_shorts and buy_run >= cfg["min_buy_bricks"]:
-                    entry = b["close"]
-                    atr = b["atr"]
-                    entry_idx = b["idx"]
-                    dup = (last_entry_price > 0 and
-                           abs(entry - last_entry_price) < cfg["atr_gap_mult"] * atr)
-                    if not dup:
-                        sl_dist = cfg["sl_mult"] * atr
-                        sl = entry + sl_dist
-                        tp = entry - cfg["risk_reward_ratio"] * sl_dist
-                        open_trade = {
-                            "side": "SHORT", "entry": entry, "sl": sl, "tp": tp, "atr": atr,
-                            "entry_idx": entry_idx, "entry_time": times[entry_idx],
-                        }
-                buy_run = 0
-                sell_run += 1
-            else:
-                # ---- possible LONG entry: bullish brick after a bearish run ----
-                if sell_run >= cfg["min_sell_bricks"]:
-                    entry = b["close"]
-                    atr = b["atr"]
-                    entry_idx = b["idx"]
-                    dup = (last_entry_price > 0 and
-                           abs(entry - last_entry_price) < cfg["atr_gap_mult"] * atr)
-                    if not dup:
-                        sl_dist = cfg["sl_mult"] * atr
-                        sl = entry - sl_dist
-                        tp = entry + cfg["risk_reward_ratio"] * sl_dist
-                        open_trade = {
-                            "side": "LONG", "entry": entry, "sl": sl, "tp": tp, "atr": atr,
-                            "entry_idx": entry_idx, "entry_time": times[entry_idx],
-                        }
-                sell_run = 0
-                buy_run += 1
-            i += 1
+        if state == "FLAT":
+            equity_curve[i] = equity
+            if row["cross_up"] and not np.isnan(row["hma"]):
+                sl_price = row["low"]
+                state = "PENDING_ENTRY"
             continue
 
-        # ── we're in a trade: scan forward candle-by-candle for exit ──
-        t = open_trade
-        exit_found = False
-        exit_j = None
+        if state == "PENDING_ENTRY":
+            # Fill at the open of this (the next) candle
+            entry_price = row["open"]
+            risk_dist = entry_price - sl_price
+            if risk_dist <= 0:
+                risk_dist = MIN_TICK * 10
+            tp_price = entry_price + TP_MULT * risk_dist
+            entry_idx = i
+            equity_at_entry = equity  # equity right before this trade opened
+            state = "IN_POSITION"
+            equity_curve[i] = equity
+            continue
 
-        for j in range(t["entry_idx"] + 1, len(closes)):
-            if t["side"] == "LONG":
-                hit_tp = highs[j] >= t["tp"]
-                hit_sl = lows[j]  <= t["sl"]
-            else:
-                hit_tp = lows[j]  <= t["tp"]
-                hit_sl = highs[j] >= t["sl"]
-
-            if not (hit_tp or hit_sl):
-                continue
+        if state == "IN_POSITION":
+            hit_tp = row["high"] >= tp_price
+            hit_sl = row["low"] <= sl_price
+            exit_price = None
+            exit_reason = None
 
             if hit_tp and hit_sl:
-                outcome = resolve_ambiguous_exit(cfg, opens[j], closes[j], t["side"])
+                if CONSERVATIVE_SAME_BAR_FILL:
+                    exit_price, exit_reason = sl_price, "SL"
+                else:
+                    exit_price, exit_reason = tp_price, "TP"
             elif hit_tp:
-                outcome = "TP"
+                exit_price, exit_reason = tp_price, "TP"
+            elif hit_sl:
+                exit_price, exit_reason = sl_price, "SL"
+
+            if exit_price is not None:
+                gross_mult = exit_price / entry_price
+                equity_before = equity
+                equity = equity * gross_mult * (1 - COMMISSION_RATE) ** 2
+                trades.append({
+                    "entry_time": df.iloc[entry_idx]["open_time"],
+                    "exit_time": row["open_time"],
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "reason": exit_reason,
+                    "bars_held": i - entry_idx,
+                    "return_pct": (equity / equity_before - 1) * 100,
+                    "equity_after": equity,
+                })
+                state = "FLAT"
+                sl_price = entry_price = tp_price = entry_idx = None
+                equity_curve[i] = equity
             else:
-                outcome = "SL"
+                # Mark-to-market the open position so the equity curve/drawdown
+                # reflect intra-trade price action, not just realized P&L.
+                equity_curve[i] = equity_at_entry * (row["close"] / entry_price) * (1 - COMMISSION_RATE)
 
-            exit_price = t["tp"] if outcome == "TP" else t["sl"]
-            entry_fill, exit_fill = apply_fill_prices(t["side"], t["entry"], exit_price, slip_frac)
-
-            if t["side"] == "LONG":
-                gross_pct = (exit_fill - entry_fill) / entry_fill
-            else:
-                gross_pct = (entry_fill - exit_fill) / entry_fill
-
-            net_pct = gross_pct - 2 * fee_frac   # fee charged on entry AND exit
-
-            trades.append({
-                "side"      : t["side"],
-                "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
-                "exit_time" : datetime.fromtimestamp(times[j]/1000, tz=timezone.utc),
-                "entry"     : t["entry"],
-                "sl"        : t["sl"],
-                "tp"        : t["tp"],
-                "atr"       : t["atr"],
-                "outcome"   : outcome,
-                "gross_pct" : gross_pct * 100,
-                "net_pct"   : net_pct * 100,
-                "bars_held" : j - t["entry_idx"],
-            })
-
-            last_entry_price = t["entry"]
-            open_trade = None
-            exit_found = True
-            exit_j = j
-            break
-
-        if exit_found:
-            # FIX (CRITICAL): skip every brick that formed WHILE this trade
-            # was open. Those bricks occurred concurrently with a position
-            # the live bot would never have acted on (one trade at a time),
-            # so they must not be replayed as signals once the trade closes.
-            while i < n_bricks and bricks[i]["idx"] <= exit_j:
-                i += 1
-            sell_run = 0
-            buy_run = 0
-            continue
-        else:
-            # trade never closed within available data (still "open" at end)
-            side = t["side"]
-            entry_fill, _ = apply_fill_prices(side, t["entry"], t["entry"], slip_frac)
-            if side == "LONG":
-                gross_pct = (closes[-1] - entry_fill) / entry_fill
-            else:
-                gross_pct = (entry_fill - closes[-1]) / entry_fill
-            net_pct = gross_pct - fee_frac  # FIX (medium): only entry-side fee has actually been paid
-
-            trades.append({
-                "side"      : side,
-                "entry_time": datetime.fromtimestamp(t["entry_time"]/1000, tz=timezone.utc),
-                "exit_time" : None,
-                "entry"     : t["entry"],
-                "sl"        : t["sl"],
-                "tp"        : t["tp"],
-                "atr"       : t["atr"],
-                "outcome"   : "OPEN_AT_END",
-                "gross_pct" : gross_pct * 100,
-                "net_pct"   : net_pct * 100,
-                "bars_held" : len(closes) - 1 - t["entry_idx"],
-            })
-            open_trade = None
-            break  # no more candle data left to resolve anything further
-
-    return trades
+    df["equity"] = equity_curve
+    df["equity"] = df["equity"].ffill().fillna(INITIAL_CAPITAL)
+    trades_df = pd.DataFrame(trades)
+    return trades_df, df
 
 
-# ─────────────────────────────────────────────────────────────
-#  PERFORMANCE SUMMARY
-# ─────────────────────────────────────────────────────────────
-def summarize(trades: list, cfg: dict):
-    if not trades:
-        print("\nNo trades were generated over this period — "
-              "try loosening min_sell_bricks or the lookback window.")
-        return None
+# ============================== METRICS ==================================
+def summarize(trades: pd.DataFrame, df: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {"trades": 0}
 
-    df = pd.DataFrame(trades)
-    closed = df[df["outcome"] != "OPEN_AT_END"]
+    wins = trades[trades["return_pct"] > 0]
+    losses = trades[trades["return_pct"] <= 0]
+    total_return_pct = (df["equity"].iloc[-1] / INITIAL_CAPITAL - 1) * 100
 
-    n_total  = len(df)
-    n_closed = len(closed)
-    n_tp     = (closed["outcome"] == "TP").sum()
-    n_sl     = (closed["outcome"] == "SL").sum()
+    years = (df["open_time"].iloc[-1] - df["open_time"].iloc[0]).days / 365.25
+    cagr = ((df["equity"].iloc[-1] / INITIAL_CAPITAL) ** (1 / years) - 1) * 100 if years > 0 else np.nan
 
-    win_rate  = n_tp / n_closed * 100 if n_closed else 0.0
+    running_max = df["equity"].cummax()
+    drawdown = (df["equity"] - running_max) / running_max
+    max_dd_pct = drawdown.min() * 100
 
-    gains  = closed.loc[closed["net_pct"] > 0, "net_pct"].sum()
-    losses = -closed.loc[closed["net_pct"] < 0, "net_pct"].sum()
-    profit_factor = gains / losses if losses > 0 else float("inf")
+    gross_profit = wins["equity_after"].sub(
+        wins["equity_after"] / (1 + wins["return_pct"] / 100)
+    ).sum() if not wins.empty else 0
+    gross_loss = -losses["equity_after"].sub(
+        losses["equity_after"] / (1 + losses["return_pct"] / 100)
+    ).sum() if not losses.empty else 0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.nan
 
-    avg_win   = closed.loc[closed["outcome"] == "TP", "net_pct"].mean() if n_tp else 0
-    avg_loss  = closed.loc[closed["outcome"] == "SL", "net_pct"].mean() if n_sl else 0
-    expectancy = closed["net_pct"].mean() if n_closed else 0
-
-    # ---- equity curve ----
-    # FIX (HIGH): position size now actually derives from the SL distance
-    # in "risk_based" mode, so risk_pct_per_trade truly reflects capital
-    # at risk if the stop is hit. "fixed_fraction" keeps the old behaviour
-    # (allocate a flat % of capital to every trade's raw return).
-    mode = cfg.get("position_sizing_mode", "risk_based")
-    risk_frac_cfg = cfg["risk_pct_per_trade"] / 100.0
-    max_lev = cfg.get("max_leverage", 1.0)
-
-    equity = cfg["initial_capital"]
-    curve = [equity]
-    for _, row in closed.iterrows():
-        sl_dist_pct = abs(row["entry"] - row["sl"]) / row["entry"]
-        if mode == "risk_based":
-            position_fraction = 0.0 if sl_dist_pct <= 0 else min(risk_frac_cfg / sl_dist_pct, max_lev)
-        else:  # fixed_fraction (legacy behaviour)
-            position_fraction = min(risk_frac_cfg, max_lev)
-
-        equity *= (1 + (row["net_pct"] / 100.0) * position_fraction)
-        curve.append(equity)
-    curve = np.array(curve)
-
-    running_max = np.maximum.accumulate(curve)
-    drawdowns = (curve - running_max) / running_max * 100
-    max_dd = drawdowns.min()
-
-    total_return_pct = (curve[-1] / curve[0] - 1) * 100
-
-    print("\n" + "═" * 60)
-    print(f"  BACKTEST SUMMARY — {cfg['symbol']} {cfg['timeframe']} "
-          f"({cfg['lookback_days']}d)")
-    print("═" * 60)
-    print(f"  Params        : ATR({cfg['atr_period']}) | "
-          f"brick={cfg['renko_mult']}xATR | SL={cfg['sl_mult']}xATR | "
-          f"R:R={cfg['risk_reward_ratio']} | min_sell={cfg['min_sell_bricks']} | "
-          f"shorts={'on' if cfg.get('allow_shorts') else 'off'}")
-    print(f"  Sizing        : mode={mode} | risk_pct_per_trade={cfg['risk_pct_per_trade']}% "
-          f"| max_leverage={max_lev}x")
-    print(f"  Total signals : {n_total}  ({n_closed} closed, "
-          f"{n_total - n_closed} still open at data end)")
-    print(f"  Wins / Losses : {n_tp} / {n_sl}")
-    print(f"  Win rate      : {win_rate:.1f}%")
-    print(f"  Avg win       : {avg_win:+.2f}%")
-    print(f"  Avg loss      : {avg_loss:+.2f}%")
-    print(f"  Expectancy/tr : {expectancy:+.3f}%")
-    print(f"  Profit factor : {profit_factor:.2f}")
-    print(f"  Total return  : {total_return_pct:+.1f}%  "
-          f"(${cfg['initial_capital']:.0f} → ${curve[-1]:.0f})")
-    print(f"  Max drawdown  : {max_dd:.1f}%")
-    print(f"  Avg bars held : {closed['bars_held'].mean():.1f}")
-    print("═" * 60)
-
-    return {"df": df, "curve": curve, "max_dd": max_dd,
-            "total_return_pct": total_return_pct}
+    return {
+        "trades": len(trades),
+        "win_rate_pct": len(wins) / len(trades) * 100,
+        "avg_win_pct": wins["return_pct"].mean() if not wins.empty else 0,
+        "avg_loss_pct": losses["return_pct"].mean() if not losses.empty else 0,
+        "profit_factor": profit_factor,
+        "total_return_pct": total_return_pct,
+        "cagr_pct": cagr,
+        "max_drawdown_pct": max_dd_pct,
+        "final_equity": df["equity"].iloc[-1],
+        "years": years,
+    }
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
-def main(cfg=None):
-    cfg = cfg or CONFIG
+def print_summary(stats: dict):
+    if stats.get("trades", 0) == 0:
+        print("No trades were generated.")
+        return
+    print("\n===================== BACKTEST SUMMARY =====================")
+    print(f"Period covered        : {stats['years']:.2f} years")
+    print(f"Total trades          : {stats['trades']}")
+    print(f"Win rate              : {stats['win_rate_pct']:.2f}%")
+    print(f"Avg win               : {stats['avg_win_pct']:.2f}%")
+    print(f"Avg loss              : {stats['avg_loss_pct']:.2f}%")
+    print(f"Profit factor         : {stats['profit_factor']:.2f}")
+    print(f"Total return          : {stats['total_return_pct']:.2f}%")
+    print(f"CAGR                  : {stats['cagr_pct']:.2f}%")
+    print(f"Max drawdown          : {stats['max_drawdown_pct']:.2f}%")
+    print(f"Final equity          : ${stats['final_equity']:,.2f}")
+    print("==============================================================\n")
 
-    opens, highs, lows, closes, times = fetch_historical_klines(
-        cfg["symbol"], cfg["timeframe"], cfg["lookback_days"])
 
-    atr_arr = calc_atr(highs, lows, closes, cfg["atr_period"])
-    bricks  = build_renko(closes, atr_arr, cfg["renko_mult"])
-    print(f"[RENKO] Built {len(bricks)} bricks from {len(closes)} candles")
+def plot_equity_curve(df: pd.DataFrame, out_path: str):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df["open_time"], df["equity"], color="#1f9d55", linewidth=1.2)
+    ax.set_title(f"{SYMBOL} {INTERVAL} - HMA({HMA_LEN}) Crossover Strategy (TP={TP_MULT}x SL)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity (USD)")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
-    trades = run_backtest(opens, highs, lows, closes, times, bricks, cfg)
-    result = summarize(trades, cfg)
 
-    if result is not None:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+# ================================ MAIN ====================================
+def main():
+    end_dt = dt.datetime.utcnow()
+    start_dt = end_dt - dt.timedelta(days=365 * YEARS_BACK)
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
 
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(result["curve"], color="#2563eb", linewidth=1.5)
-            ax.set_title(f"{cfg['symbol']} {cfg['timeframe']} Renko-ATR — "
-                         f"Equity Curve ({cfg['lookback_days']}d)")
-            ax.set_xlabel("Trade #")
-            ax.set_ylabel("Equity ($)")
-            ax.grid(alpha=0.3)
-            fig.tight_layout()
-            out_png = "/mnt/user-data/outputs/renko_backtest_equity_curve.png"
-            fig.savefig(out_png, dpi=150)
-            print(f"Saved equity curve → {out_png}")
-        except Exception as e:
-            print(f"[WARN] Could not save equity curve chart: {e}")
+    df = fetch_binance_klines(SYMBOL, INTERVAL, start_ms, end_ms)
+    print(f"Loaded {len(df)} candles from {df['open_time'].iloc[0]} to {df['open_time'].iloc[-1]}")
 
-    return trades, result
+    trades, df = run_backtest(df)
+    stats = summarize(trades, df)
+    print_summary(stats)
+
+    trades_path = "trades.csv"
+    equity_path = "equity_curve.png"
+    trades.to_csv(trades_path, index=False)
+    plot_equity_curve(df, equity_path)
+    print(f"Saved trade log to {trades_path}")
+    print(f"Saved equity curve chart to {equity_path}")
 
 
 if __name__ == "__main__":
